@@ -33,8 +33,8 @@ public:
         float lowe_ratio         = 0.75f;
         int   min_tracked_points = 80;   // below → keyframe insertion
         int   pnp_iterations     = 200;
-        float pnp_reprojection   = 4.0f; // pixels (RANSAC threshold)
-        int   pnp_min_inliers    = 20;   // minimum PnP inliers to accept pose
+        float pnp_reprojection   = 5.5f; // pixels (RANSAC threshold)
+        int   pnp_min_inliers    = 15;   // minimum PnP inliers to accept pose
         float init_min_disparity = 5.0f;  // min mean 2D disparity (px) before init attempt
         float init_median_depth  = 20.0f; // target median map-point depth after init (m)
     };

@@ -292,7 +292,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(),
         rvec, tvec, /*useExtrinsicGuess=*/velocity_valid_,
         cfg_.pnp_iterations, cfg_.pnp_reprojection, 0.99,
-        inlier_mask, cv::SOLVEPNP_EPNP);
+        inlier_mask, cv::SOLVEPNP_SQPNP);
     if (!ok) {
         std::cerr << "[Tracker] Track: solvePnPRansac failed (" << pts3d.size() << " corr)\n";
         return false;
@@ -583,7 +583,7 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
         pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(),
         rvec, tvec, /*useExtrinsicGuess=*/false,
         cfg_.pnp_iterations, cfg_.pnp_reprojection, 0.99,
-        inlier_mask, cv::SOLVEPNP_EPNP);
+        inlier_mask, cv::SOLVEPNP_SQPNP);
 
     if (!ok) { std::cerr << "[Reloc] solvePnPRansac failed\n"; return false; }
 
