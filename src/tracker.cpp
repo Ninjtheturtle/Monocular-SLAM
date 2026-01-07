@@ -392,6 +392,7 @@ void Tracker::insert_keyframe(Frame::Ptr frame)
     last_kf_pnp_tracked_ = frame->num_tracked();
 
     frame->id = g_frame_id++;
+    frame->is_keyframe = true;
 
     // Triangulate new map points between this keyframe and the previous one.
     // Only attempt unmatched keypoints in the new frame (those without a map point).
