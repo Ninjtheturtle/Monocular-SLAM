@@ -36,7 +36,7 @@ public:
         float pnp_reprojection   = 5.5f; // pixels (RANSAC threshold)
         int   pnp_min_inliers    = 15;   // minimum PnP inliers to accept pose
         float stereo_epi_tol  = 2.0f;   // stereo epipolar row tolerance (pixels)
-        float stereo_d_min    = 2.0f;   // minimum stereo disparity (pixels; ~193 m max depth for KITTI)
+        float stereo_d_min    = 3.0f;   // minimum stereo disparity (pixels; ~128 m max depth, 17% depth uncertainty)
         float stereo_d_max    = 300.0f; // maximum stereo disparity (pixels; ~0.35 m depth)
     };
 

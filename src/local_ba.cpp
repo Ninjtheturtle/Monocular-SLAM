@@ -271,6 +271,30 @@ class AnalyticStereoReprojectionCostFunction
     StereoReprojectionCost cost_;
 };
 
+// ─── Pitch/Roll Soft Constraint ───────────────────────────────────────────────
+// Prevents implausible pitch/roll jumps (e.g. 30° at turns) without any
+// height reference (h_ref). Height is constrained naturally by stereo v_L/v_R.
+//
+//   w_rp = 30.0 → σ_rp = 0.033 rad = 1.9°  (blocks 30° jumps; allows vibration)
+//
+// Only 2 residuals — NO height component — so no h_ref drift problem.
+// NO SubsetManifold — all 6 DOFs remain free.
+struct PitchRollCost {
+    double w_rp;
+    template <typename T>
+    bool operator()(const T* const pose, T* residuals) const {
+        T R[9];
+        ceres::AngleAxisToRotationMatrix(pose, R);
+        residuals[0] = T(w_rp) * R[3];   // R(1,0) — roll proxy  → 0 when level
+        residuals[1] = T(w_rp) * R[5];   // R(1,2) — pitch proxy → 0 when level
+        return true;
+    }
+    static ceres::CostFunction* Create(double w_rp) {
+        return new ceres::AutoDiffCostFunction<PitchRollCost, 2, 6>(
+            new PitchRollCost{w_rp});
+    }
+};
+
 // ─── Pose Prior Cost (motion model smoothing) ─────────────────────────────────
 //
 // Soft anchor: penalises deviation of each non-anchor KF from its pre-BA
@@ -443,7 +467,19 @@ void LocalBA::optimize() {
         problem.SetParameterBlockConstant(oldest_pose);
     }
 
-    // ── 4b. Pose prior (motion model soft anchor) ────────────────────────────
+    // ── 4b. Pitch/roll soft constraint (stereo only) ─────────────────────────
+    // Prevents implausible camera tilts at turns without freezing any DOF
+    // and without a height reference (which drifts as the BA window slides).
+    if (cam_.is_stereo()) {
+        for (auto& kf : window) {
+            if (kf == window.front()) continue;
+            problem.AddResidualBlock(
+                PitchRollCost::Create(30.0),
+                nullptr, pose_params[kf->id].data());
+        }
+    }
+
+    // ── 4c. Pose prior (motion model soft anchor) ────────────────────────────
     // Soft anchor to the pre-BA PnP estimate for each non-anchor KF.
     // Prevents BA from diverging to implausible positions when reprojection
     // observations are very sparse (dark turns, near-LOST states).

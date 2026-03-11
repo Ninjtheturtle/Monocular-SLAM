@@ -465,7 +465,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
             return false;
         }
         double delta_trans = delta.translation().norm();
-        if (delta_trans > 3.0) {   // >3 m/frame ≈ 108 km/h at 10 Hz
+        if (delta_trans > 5.0) {   // >5 m/frame ≈ 180 km/h at 10 Hz
             std::cerr << "[Tracker] PnP rejected: delta trans "
                       << delta_trans << " m\n";
             return false;
