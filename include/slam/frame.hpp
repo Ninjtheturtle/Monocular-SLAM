@@ -12,20 +12,17 @@ namespace slam {
 
 class MapPoint;
 
-/// Represents a single processed image frame.
-///
-/// Pose convention:  T_cw  — transforms a world-frame point X_w into camera
-/// frame:  X_c = R_cw * X_w + t_cw
-///
-/// The pose is stored as a 4×4 SE3 matrix (Eigen::Isometry3d).
+/// a single processed image frame.
+/// pose convention: T_cw transforms X_w (world) to camera frame: X_c = R_cw * X_w + t_cw
+/// stored as Eigen::Isometry3d (4×4 SE3 matrix).
 class Frame {
 public:
     using Ptr = std::shared_ptr<Frame>;
 
-    // ── Factory ──────────────────────────────────────────────────────────────
+    // factory
     static Ptr create(const cv::Mat& image, double timestamp, long id);
 
-    // ── Data ─────────────────────────────────────────────────────────────────
+    // data
     long   id;
     double timestamp;           // seconds
     cv::Mat image_gray;         // grayscale, 8U
@@ -39,10 +36,10 @@ public:
     std::vector<cv::KeyPoint> keypoints_right;
     cv::Mat                   descriptors_right;
 
-    // Right x-coordinate per left keypoint (-1.0f = no stereo match)
+    // right x-coordinate per left keypoint (-1.0f = no stereo match)
     std::vector<float> uR;
 
-    // Map associations (one per keypoint; nullptr = unmatched)
+    // map associations (one per keypoint; nullptr = unmatched)
     std::vector<std::shared_ptr<MapPoint>> map_points;
 
     // Pose: world → camera (T_cw)
@@ -51,21 +48,21 @@ public:
     // Whether this frame is promoted to a keyframe
     bool is_keyframe = false;
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-    /// Camera-to-world transform (inverse of T_cw)
+    // helpers
+    /// camera-to-world transform (inverse of T_cw)
     Eigen::Isometry3d T_wc() const { return T_cw.inverse(); }
 
-    /// Camera centre in world coordinates
+    /// camera centre in world coordinates
     Eigen::Vector3d camera_center() const { return T_wc().translation(); }
 
-    /// Descriptor row as a byte pointer (for GPU upload)
+    /// descriptor row as a byte pointer (for GPU upload)
     const uint8_t* desc_ptr() const {
         return descriptors.data;
     }
 
     int num_features() const { return static_cast<int>(keypoints.size()); }
 
-    /// Count keypoints with valid map point associations
+    /// count keypoints with valid map point associations
     int num_tracked() const;
 
 private:

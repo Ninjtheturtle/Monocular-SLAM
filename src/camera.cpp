@@ -8,10 +8,7 @@ namespace slam {
 
 Camera Camera::from_kitti_calib(const std::string& calib_file)
 {
-    // KITTI calib.txt format — each row is a label followed by 12 values.
-    // P0: 3×4 projection matrix for left grayscale camera  (baseline = 0)
-    // P1: 3×4 projection matrix for right grayscale camera (P1[3] = -fx·b)
-    // Baseline b = -P1[3] / fx
+    // P0 = left grayscale intrinsics, P1[3] = -fx·b → baseline = -P1[3]/fx
 
     std::ifstream f(calib_file);
     if (!f.is_open()) {
@@ -52,10 +49,7 @@ Camera Camera::from_kitti_calib(const std::string& calib_file)
     if (!got_p0)
         throw std::runtime_error("P0 not found in calib file: " + calib_file);
 
-    // ── Diagnostic: compare P0/P1 (grayscale) vs P2/P3 (color) baselines ────
-    // A wrong camera choice causes scale error:
-    //   KITTI seq 00 — P1 baseline ≈ 0.537 m, P3 baseline ≈ 0.469 m (13% smaller)
-    // 13% smaller baseline → 13% underestimated depths → loops 13% smaller than GT.
+    // diagnostic: warn if P2/P3 (color) baseline differs from P0/P1 — wrong choice causes scale error
     {
         std::ifstream f2(calib_file);
         bool got_p2 = false, got_p3 = false;

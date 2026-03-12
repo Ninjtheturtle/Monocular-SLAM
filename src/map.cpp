@@ -3,7 +3,7 @@
 
 namespace slam {
 
-// ─── Keyframe management ─────────────────────────────────────────────────────
+// keyframe management
 
 void Map::insert_keyframe(Frame::Ptr kf)
 {
@@ -53,7 +53,7 @@ std::vector<Frame::Ptr> Map::local_window(int size) const
         keyframe_order_.begin() + start, keyframe_order_.end());
 }
 
-// ─── Map point management ─────────────────────────────────────────────────────
+// map point management
 
 void Map::insert_map_point(MapPoint::Ptr mp)
 {
@@ -98,7 +98,7 @@ void Map::reset()
 {
     {
         std::lock_guard<std::mutex> lk(kf_mutex_);
-        // Archive current keyframes before wiping so log_trajectory() can still draw them.
+        // archive current KFs before wiping so log_trajectory() can still draw them
         for (auto& kf : keyframe_order_)
             trajectory_archive_.push_back(kf);
         keyframe_order_.clear();

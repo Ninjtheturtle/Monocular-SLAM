@@ -12,11 +12,11 @@
 
 namespace slam {
 
-// ─── Global frame ID counter ──────────────────────────────────────────────────
+// global frame and point ID counters
 static std::atomic<long> g_frame_id{0};
 static std::atomic<long> g_point_id{0};
 
-// ─── Factory ─────────────────────────────────────────────────────────────────
+// factory
 
 Tracker::Ptr Tracker::create(const Camera& cam, Map::Ptr map, const Config& cfg)
 {
@@ -33,16 +33,16 @@ Tracker::Ptr Tracker::create(const Camera& cam, Map::Ptr map, const Config& cfg)
     return t;
 }
 
-// ─── Main entry point ────────────────────────────────────────────────────────
+// main entry point
 
 bool Tracker::track(Frame::Ptr frame)
 {
-    // Extract ORB features on left image
+    // extract ORB features on left image
     orb_->detectAndCompute(frame->image_gray, cv::noArray(),
                            frame->keypoints, frame->descriptors);
     frame->map_points.resize(frame->keypoints.size(), nullptr);
 
-    // Extract ORB features on right image and perform stereo epipolar matching
+    // extract ORB on right image and run stereo epipolar matching
     if (!frame->image_right.empty()) {
         orb_->detectAndCompute(frame->image_right, cv::noArray(),
                                frame->keypoints_right, frame->descriptors_right);
@@ -50,7 +50,7 @@ bool Tracker::track(Frame::Ptr frame)
         match_stereo(frame);
     }
 
-    // ── LOST: try to relocalize against the full map before reinitializing ─────
+    // LOST: try to relocalize against the full map before reinitializing
     if (state_ == TrackingState::LOST) {
         if (try_relocalize(frame)) {
             std::cout << "[Tracker] Relocalized successfully — resuming on existing map\n";
@@ -59,13 +59,8 @@ bool Tracker::track(Frame::Ptr frame)
             last_frame_     = frame;
             return true;
         }
-        // Relocalization failed — reset map and tracker state to avoid contaminating
-        // the existing map with new keyframes placed at T_cw = Identity.  Without
-        // this reset, BA would receive frames from two different world origins and
-        // diverge immediately.
+        // relocalization failed — reset and reinit from current position
         std::cerr << "[Tracker] LOST — relocalization failed, resetting map + re-initializing\n";
-        // Propagate pose so initialize() roots the new map at the last known world position.
-        // Without this, frame->T_cw stays at Identity (Frame default) → trajectory resets to (0,0,0).
         frame->T_cw = velocity_valid_ ? (velocity_ * last_frame_->T_cw) : last_frame_->T_cw;
         map_->reset();
         last_keyframe_       = nullptr;
@@ -76,13 +71,8 @@ bool Tracker::track(Frame::Ptr frame)
         return false;
     }
 
-    if (state_ == TrackingState::NOT_INITIALIZED) {
-        // initialize() manages last_frame_ internally:
-        //   - insufficient disparity → keep last_frame_ anchored (accumulate baseline)
-        //   - other failures         → advance last_frame_ = frame
-        //   - success                → advance last_frame_ = frame (after velocity_)
+    if (state_ == TrackingState::NOT_INITIALIZED)
         return initialize(frame);
-    }
 
     // OK state
     bool ok = track_with_motion_model(frame);
@@ -92,7 +82,7 @@ bool Tracker::track(Frame::Ptr frame)
     } else {
         ++lost_streak_;
         if (lost_streak_ < 8) {
-            // Short dead-reckoning: cover brief match failures without a full LOST reset.
+            // coast: dead-reckon for a few frames before declaring LOST
             frame->T_cw = velocity_valid_
                 ? velocity_ * last_frame_->T_cw
                 : last_frame_->T_cw;
@@ -106,15 +96,12 @@ bool Tracker::track(Frame::Ptr frame)
     return ok;
 }
 
-// ─── Initialization ──────────────────────────────────────────────────────────
+// initialization
 
 bool Tracker::initialize(Frame::Ptr frame)
 {
-    // ── Stereo path: single-frame metric initialization ───────────────────────
     if (cam_.is_stereo() && !frame->uR.empty()) {
-        // Propagate last known pose so reinit roots at current world position.
-        // Without this, frame->T_cw is Identity (Frame default) and
-        // triangulate_stereo() places all new map points at world origin.
+        // stereo path: propagate last pose so reinit doesn't jump to origin
         if (last_frame_) {
             frame->T_cw = last_frame_->T_cw;
         }
@@ -132,7 +119,7 @@ bool Tracker::initialize(Frame::Ptr frame)
         return true;
     }
 
-    // ── Monocular fallback: temporal two-frame initialization ─────────────────
+    // monocular fallback
     if (!last_frame_) {
         last_frame_ = frame;
         return false;
@@ -154,7 +141,7 @@ bool Tracker::initialize(Frame::Ptr frame)
         pts1.push_back(frame->keypoints[m.trainIdx].pt);
     }
 
-    // Require sufficient 2D feature displacement to avoid degenerate init
+    // require sufficient 2D feature displacement to avoid degenerate init
     {
         double sum_disp = 0.0;
         for (size_t i = 0; i < pts0.size(); ++i) {
@@ -205,7 +192,7 @@ bool Tracker::initialize(Frame::Ptr frame)
         last_frame_ = frame; return false;
     }
 
-    // Scale to ~20 m median depth (monocular scale ambiguity workaround)
+    // scale to ~20 m median depth (monocular scale ambiguity workaround)
     {
         std::vector<double> depths;
         depths.reserve(n_pts);
@@ -238,37 +225,28 @@ bool Tracker::initialize(Frame::Ptr frame)
     return true;
 }
 
-// ─── Tracking with constant-velocity model ────────────────────────────────────
-//
-// Builds 3D-2D correspondences by GPU-matching descriptors from ALL local
-// keyframes' map points against the current frame.  This avoids the rapid
-// attrition that occurs when only last_frame_'s sparse point set is used,
-// while preserving descriptor-based verification (no false geometric matches).
+// constant-velocity tracking — matches against all local KF map points
 
 bool Tracker::track_with_motion_model(Frame::Ptr frame)
 {
-    // Predict pose
+    // predict pose
     if (velocity_valid_) {
         frame->T_cw = velocity_ * last_frame_->T_cw;
     } else {
         frame->T_cw = last_frame_->T_cw;
     }
 
-    // Build descriptor pool: one row per unique map point from local keyframes.
-    // We use the keyframe's stored ORB descriptor row for each mapped keypoint.
+    // build descriptor pool from the last 30 KFs
     cv::Mat                    pool_desc;
     std::vector<MapPoint::Ptr> pool_mps;
     {
         std::unordered_set<long> seen_ids;
-        // Use a wider window (30 KFs) so that when KFs are inserted rapidly
-        // (small baseline, low-texture scene), the pool still has enough
-        // diverse 3D-2D candidates for robust PnP.
         for (auto& kf : map_->local_window(30)) {
             if (kf->descriptors.empty()) continue;
             for (int i = 0; i < (int)kf->map_points.size(); ++i) {
                 auto& mp = kf->map_points[i];
                 if (!mp || mp->is_bad) continue;
-                if (mp->observed_times < 2) continue; // skip single-observation (unverified) points
+                if (mp->observed_times < 2) continue; // skip unverified single-view points
                 if (!seen_ids.insert(mp->id).second) continue; // skip duplicates
                 if (i >= kf->descriptors.rows) continue;
                 pool_desc.push_back(kf->descriptors.row(i));
@@ -281,44 +259,30 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         return false;
     }
 
-    // ─── Correspondence building: two-phase matching ──────────────────────────
-    //   Phase 1 (preferred): project pool map points with predicted T_cw and
-    //     search for nearest unmatched keypoint within search_r px (no ratio test).
-    //     Spatial proximity replaces the ratio test, making this robust to
-    //     repetitive-texture roads and sharp turns.
-    //   Phase 2 (fallback): GPU Hamming + ratio test when Phase 1 yields too few.
-    // ─────────────────────────────────────────────────────────────────────────────
+    // phase 1: spatial search around projected pool points. phase 2: GPU Hamming fallback.
     std::vector<cv::Point3f>   pts3d;
     std::vector<cv::Point2f>   pts2d;
     std::vector<int>           match_idxs;
     std::vector<MapPoint::Ptr> match_mps;
     std::unordered_set<int>    used_kp;
 
-    // ── Phase 1: projection-based spatial matching ────────────────────────────
+    // phase 1: projection-based spatial matching
     {
         const int   cell     = 16;
         const int   frame_w  = frame->image_gray.cols;
         const int   frame_h  = frame->image_gray.rows;
         const int   n_cols_g = (frame_w + cell - 1) / cell;
         const int   n_rows_g = (frame_h + cell - 1) / cell;
-        // Widen the search window when the motion model predicts significant rotation (turn).
-        // Constant-velocity extrapolation overshoots at turns; the extra radius compensates so
-        // that Phase 1 still finds ~300+ matches instead of collapsing to ~50.
-        //   0°/frame  →  40 px   (straight road)
-        //   1.7°/frame → 60 px
-        //   3.4°/frame → 80 px
-        //   ≥5.2°/frame → 120 px (cap)
+        // widen search at turns; base_r=70 when velocity is invalid (one frame after BA)
         const double pred_ang = velocity_valid_
             ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
-        // When velocity is invalid (one frame after BA), widen base radius to compensate
-        // for 1-frame camera displacement without a rotation prediction.
         const float base_r = velocity_valid_ ? 40.0f : 70.0f;
         const float search_r = (pred_ang > 0.03)
             ? std::min(120.0f, base_r + float(pred_ang / 0.03) * 20.0f)
             : base_r;
         const int   max_ham  = cfg_.hamming_threshold;
 
-        // Build spatial grid: cell → list of keypoint indices
+        // build spatial grid: cell → list of keypoint indices
         std::vector<std::vector<int>> kp_grid(n_cols_g * n_rows_g);
         for (int j = 0; j < (int)frame->keypoints.size(); ++j) {
             int cx = std::min(n_cols_g - 1, (int)(frame->keypoints[j].pt.x / cell));
@@ -362,7 +326,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                   << "/" << pool_mps.size() << " pts\n";
     }
 
-    // ── Phase 2: GPU Hamming fallback ─────────────────────────────────────────
+    // phase 2: GPU Hamming fallback
     if ((int)pts3d.size() < cfg_.pnp_min_inliers) {
         pts3d.clear(); pts2d.clear(); match_idxs.clear(); match_mps.clear(); used_kp.clear();
         auto raw_matches = match_descriptors(pool_desc, frame->descriptors, /*use_ratio=*/true);
@@ -394,12 +358,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         tvec.at<double>(1) = frame->T_cw.translation().y();
         tvec.at<double>(2) = frame->T_cw.translation().z();
     }
-    // Only use the velocity prediction as an initial guess when velocity is
-    // actually valid AND the predicted rotation is small.  At high angular
-    // rates (sharp turns) the constant-velocity extrapolation overshoots;
-    // using it as a RANSAC seed biases hypothesis sampling away from the true
-    // pose.  With useExtrinsicGuess=false RANSAC searches freely.
-    // Threshold: 0.3 rad ≈ 17° — well above normal driving but below overshoot zone.
+    // skip initial guess at sharp turns — overshoots bias RANSAC (threshold: 0.3 rad ≈ 17°)
     const double pred_angle = velocity_valid_
         ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
     const bool use_guess = velocity_valid_ && (pred_angle < 0.3);
@@ -414,15 +373,14 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         return false;
     }
 
-    // solvePnPRansac returns CV_32S index vector OR CV_8U mask depending on OpenCV version.
+    // inlier mask can be CV_8U (mask) or CV_32S (index vector) depending on OpenCV version
     std::vector<bool> is_inlier(pts3d.size(), false);
     int n_inliers = 0;
     if (inlier_mask.type() == CV_8U) {
-        // Mask mode: element k is 1 for inlier, 0 for outlier
         for (int k = 0; k < inlier_mask.rows && k < (int)pts3d.size(); ++k)
             if (inlier_mask.at<uint8_t>(k)) { is_inlier[k] = true; ++n_inliers; }
     } else {
-        // Index mode (CV_32S): each element is an inlier index into pts3d
+        // index mode (CV_32S): each element is an inlier index into pts3d
         for (int k = 0; k < inlier_mask.rows; ++k) {
             int idx = inlier_mask.at<int>(k);
             if (idx >= 0 && idx < (int)pts3d.size()) { is_inlier[idx] = true; ++n_inliers; }
@@ -441,7 +399,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
     cv::solvePnP(in3d, in2d, cam_.K_cv(), cam_.dist_cv(),
                  rvec, tvec, /*useExtrinsicGuess=*/true, cv::SOLVEPNP_ITERATIVE);
 
-    // ── Build candidate pose from rvec/tvec ──────────────────────────────────
+    // build candidate pose from rvec/tvec
     cv::Mat R_cv;
     cv::Rodrigues(rvec, R_cv);
     Eigen::Isometry3d T_cw_candidate = Eigen::Isometry3d::Identity();
@@ -452,14 +410,11 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                                      tvec.at<double>(1),
                                      tvec.at<double>(2);
 
-    // ── Delta-rotation & translation sanity checks ────────────────────────────
-    // A driving car cannot physically rotate >~29° or translate >5 m between
-    // consecutive frames at 10 Hz.  Rejecting implausible solutions here
-    // prevents bad poses from corrupting velocity_.
+    // delta sanity checks — a car can't rotate >~29° or move >5 m between frames at 10 Hz
     {
         Eigen::Isometry3d delta = T_cw_candidate * last_frame_->T_cw.inverse();
         double delta_angle = Eigen::AngleAxisd(delta.rotation()).angle();
-        if (delta_angle > 0.5) {    // 0.5 rad ≈ 29° — allows combined yaw+roll/pitch error at tight corners
+        if (delta_angle > 0.5) {    // 0.5 rad ≈ 29°
             std::cerr << "[Tracker] PnP rejected: delta rot "
                       << (delta_angle * (180.0 / 3.14159265358979323846)) << " deg\n";
             return false;
@@ -472,21 +427,15 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         }
     }
 
-    // Commit pose
+    // commit pose
     frame->T_cw = T_cw_candidate;
 
-    // Assign inlier map points
+    // assign inlier map points
     for (int i = 0; i < (int)pts3d.size(); ++i)
         if (is_inlier[i])
             frame->map_points[match_idxs[i]] = match_mps[i];
 
-    // ── Project-and-search: augment tracked point count ──────────────────────
-    // After PnP sets frame->T_cw, project all local map points that were NOT
-    // tried by the initial descriptor-pool matching.  For each projected point
-    // whose location is within 15 px of an unmatched keypoint AND whose
-    // descriptor distance is below threshold, assign the map point.
-    // This increases num_tracked() 3-5× without an additional RANSAC pass,
-    // leading to fewer keyframe insertions and a denser, more stable map.
+    // project-and-search: pull in more map points after PnP without a second RANSAC pass
     {
         const int   cell      = 16;
         const int   frame_w   = frame->image_gray.cols;
@@ -497,7 +446,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         const int   max_ham   = 50;
         const float max_repr2 = 25.0f;   // 5 px validation threshold²
 
-        // Spatial grid: cell → list of keypoint indices that still need a map point
+        // spatial grid: only keypoints that still need a map point
         std::vector<std::vector<int>> kp_grid(n_cols_g * n_rows_g);
         for (int j = 0; j < (int)frame->keypoints.size(); ++j) {
             if (frame->map_points[j]) continue;
@@ -507,7 +456,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
             if (cx >= 0 && cy >= 0) kp_grid[cy * n_cols_g + cx].push_back(j);
         }
 
-        // Track which map-point IDs were already tried in the descriptor-pool phase
+        // track which map-point IDs were already tried in the pool phase
         std::unordered_set<long> proj_seen;
         for (auto& mp : pool_mps) proj_seen.insert(mp->id);
 
@@ -519,14 +468,14 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                 if (!proj_seen.insert(mp->id).second) continue;  // already tried
                 if (i >= kf->descriptors.rows) continue;
 
-                // Project into frame using committed T_cw
+                // project into frame using committed T_cw
                 Eigen::Vector3d Xc = frame->T_cw * mp->position;
                 if (Xc.z() <= 0.0) continue;
                 float u = (float)(cam_.fx * Xc.x() / Xc.z() + cam_.cx);
                 float v = (float)(cam_.fy * Xc.y() / Xc.z() + cam_.cy);
                 if (u < 0 || u >= frame_w || v < 0 || v >= frame_h) continue;
 
-                // Search grid cells in (u±search_r, v±search_r)
+                // search grid cells in (u±search_r, v±search_r)
                 int cx0 = std::max(0,            (int)((u - search_r) / cell));
                 int cx1 = std::min(n_cols_g - 1, (int)((u + search_r) / cell));
                 int cy0 = std::max(0,            (int)((v - search_r) / cell));
@@ -544,7 +493,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
 
                 if (best_j < 0 || used_kp.count(best_j)) continue;
 
-                // Validate with reprojection error at committed pose
+                // validate with reprojection error at committed pose
                 float du = u - frame->keypoints[best_j].pt.x;
                 float dv = v - frame->keypoints[best_j].pt.y;
                 if (du*du + dv*dv > max_repr2) continue;
@@ -560,7 +509,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
     return true;
 }
 
-// ─── Local map tracking ───────────────────────────────────────────────────────
+// local map tracking
 
 bool Tracker::track_local_map(Frame::Ptr frame)
 {
@@ -570,7 +519,7 @@ bool Tracker::track_local_map(Frame::Ptr frame)
     return frame->num_tracked() >= cfg_.pnp_min_inliers;
 }
 
-// ─── Keyframe decision ────────────────────────────────────────────────────────
+// keyframe decision
 
 bool Tracker::need_new_keyframe(Frame::Ptr frame) const
 {
@@ -578,16 +527,9 @@ bool Tracker::need_new_keyframe(Frame::Ptr frame) const
 
     int tracked = frame->num_tracked();  // PnP inliers only (not yet triangulated)
 
-    // Use last_kf_pnp_tracked_ — the PnP-inlier count saved BEFORE triangulation
-    // at the last keyframe insertion.  Using last_keyframe_->num_tracked() would
-    // be inflated by newly triangulated points, making the ratio always < 0.8.
+    // compare against last_kf_pnp_tracked_ (pre-triangulation count) to avoid inflated ratio
     if (tracked < cfg_.min_tracked_points) return true;
     if (last_kf_pnp_tracked_ > 0 && (float)tracked / last_kf_pnp_tracked_ < 0.8f) return true;
-
-    // Parallax trigger removed: at KITTI 10 Hz, parallax > 1° fires every frame →
-    // every frame becomes a KF → BA invalidates velocity_ every frame → Phase 1
-    // always uses zero-rotation prediction → turn features fall outside search radius
-    // → LOST cascade.  Count-based triggers (tracked < 80, ratio < 0.8) are sufficient.
 
     return false;
 }
@@ -613,16 +555,13 @@ double Tracker::compute_median_parallax(Frame::Ptr frame, Frame::Ptr ref_kf) con
 
 void Tracker::insert_keyframe(Frame::Ptr frame)
 {
-    // Save PnP-inlier count BEFORE triangulation inflates frame->map_points.
+    // save PnP inlier count BEFORE triangulation inflates frame->map_points
     last_kf_pnp_tracked_ = frame->num_tracked();
 
     frame->id = g_frame_id++;
     frame->is_keyframe = true;
 
-    // Triangulate new map points between this keyframe and the last 3 KFs.
-    // Iterating oldest-first gives the KF with the largest baseline first pick of
-    // unmatched keypoints; newer KFs fill in the rest.
-    // The !frame->map_points[m.trainIdx] guard prevents double-assignment.
+    // triangulate against last 3 KFs (oldest first for largest baseline)
     for (auto& tri_kf : map_->local_window(3)) {
         if (tri_kf->id == frame->id) continue;
         auto kf_matches = match_descriptors(tri_kf->descriptors,
@@ -643,9 +582,7 @@ void Tracker::insert_keyframe(Frame::Ptr frame)
         }
     }
 
-    // Stereo enrichment: add metric-depth map points for any keypoint still
-    // unmapped.  This keeps the map dense with scale-consistent points across
-    // all keyframes, not just the initialization frame.
+    // stereo enrichment: fill unmapped keypoints with metric-depth points
     if (cam_.is_stereo() && !frame->uR.empty()) {
         int n_stereo = triangulate_stereo(frame);
         if (n_stereo > 0)
@@ -657,7 +594,7 @@ void Tracker::insert_keyframe(Frame::Ptr frame)
     last_keyframe_ = frame;
 }
 
-// ─── GPU Descriptor Matching ─────────────────────────────────────────────────
+// GPU descriptor matching
 
 std::vector<cv::DMatch> Tracker::match_descriptors(
     const cv::Mat& query_desc,
@@ -669,7 +606,7 @@ std::vector<cv::DMatch> Tracker::match_descriptors(
 
     if (N_q == 0 || N_t == 0) return {};
 
-    // Ensure descriptors are continuous and CV_8U
+    // ensure descriptors are continuous and CV_8U
     cv::Mat q = query_desc.isContinuous() ? query_desc : query_desc.clone();
     cv::Mat t = train_desc.isContinuous()  ? train_desc  : train_desc.clone();
 
@@ -696,12 +633,12 @@ std::vector<cv::DMatch> Tracker::match_descriptors(
     return matches;
 }
 
-// ─── Triangulation ───────────────────────────────────────────────────────────
+// triangulation
 
 int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
                                   const std::vector<cv::DMatch>& matches)
 {
-    // Build projection matrices (3×4)
+    // build projection matrices (3×4)
     auto make_proj = [&](const Eigen::Isometry3d& T_cw) -> cv::Mat {
         cv::Mat P(3, 4, CV_64F);
         Eigen::Matrix<double, 3, 4> Rt;
@@ -717,7 +654,7 @@ int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
     cv::Mat P0 = make_proj(ref->T_cw);
     cv::Mat P1 = make_proj(cur->T_cw);
 
-    // Collect matched point pairs
+    // collect matched point pairs
     std::vector<cv::Point2f> pts0, pts1;
     std::vector<int>         ref_kp_idxs, cur_kp_idxs;
     for (auto& m : matches) {
@@ -739,15 +676,13 @@ int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
                            pts4d.at<float>(1, i) / w,
                            pts4d.at<float>(2, i) / w);
 
-        // Depth check in both cameras
+        // depth check in both cameras
         Eigen::Vector3d Xc0 = ref->T_cw * Xw;
         Eigen::Vector3d Xc1 = cur->T_cw * Xw;
         if (Xc0.z() < 0.05 || Xc1.z() < 0.05) continue;
         if (Xc0.z() > 200.0 || Xc1.z() > 200.0) continue;
 
-        // Parallax check: skip near-degenerate triangulations (< ~1.1°).
-        // Points with tiny parallax have depth uncertainty of 100s of metres
-        // and pollute BA.
+        // skip near-degenerate triangulations (cos_pa > 0.9998 ≈ <1.1° parallax)
         {
             Eigen::Vector3d O0 = ref->camera_center();
             Eigen::Vector3d O1 = cur->camera_center();
@@ -768,17 +703,11 @@ int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
     return n_added;
 }
 
-// ─── Relocalization ───────────────────────────────────────────────────────────
-//
-// When LOST, match the current frame against ALL keyframes' map points.
-// Key differences from track_with_motion_model:
-//   • Pool from map_->all_keyframes() — full map, not just last 30 KFs
-//   • useExtrinsicGuess=false — no valid velocity to warm-start from
-//   • Stricter inlier threshold: pnp_min_inliers * 3 = 45
+// relocalization — match against all KFs with a stricter inlier threshold
 
 bool Tracker::try_relocalize(Frame::Ptr frame)
 {
-    // ── Build descriptor pool from ALL keyframes ──────────────────────────────
+    // build pool from ALL keyframes
     cv::Mat                    pool_desc;
     std::vector<MapPoint::Ptr> pool_mps;
     {
@@ -799,10 +728,9 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
 
     std::cout << "[Reloc] Matching against " << pool_desc.rows << " global map pts\n";
 
-    // ── GPU descriptor matching ───────────────────────────────────────────────
+    // GPU descriptor matching
     auto raw_matches = match_descriptors(pool_desc, frame->descriptors, true);
 
-    // ── Build 3D-2D correspondences ───────────────────────────────────────────
     std::vector<cv::Point3f>   pts3d;
     std::vector<cv::Point2f>   pts2d;
     std::vector<int>           match_idxs;
@@ -824,7 +752,7 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
     }
     std::cout << "[Reloc] " << pts3d.size() << " 3D-2D correspondences\n";
 
-    // ── PnP RANSAC — no initial guess ─────────────────────────────────────────
+    // PnP RANSAC — no initial guess (no valid velocity)
     cv::Mat rvec = cv::Mat::zeros(3, 1, CV_64F);
     cv::Mat tvec = cv::Mat::zeros(3, 1, CV_64F);
     cv::Mat inlier_mask;
@@ -856,7 +784,7 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
         return false;
     }
 
-    // ── LM refinement on inliers ──────────────────────────────────────────────
+    // LM refinement on inliers
     std::vector<cv::Point3f> in3d;
     std::vector<cv::Point2f> in2d;
     for (int i = 0; i < (int)pts3d.size(); ++i)
@@ -864,7 +792,7 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
     cv::solvePnP(in3d, in2d, cam_.K_cv(), cam_.dist_cv(),
                  rvec, tvec, true, cv::SOLVEPNP_ITERATIVE);
 
-    // ── Update frame pose ─────────────────────────────────────────────────────
+    // update frame pose
     cv::Mat R_cv;
     cv::Rodrigues(rvec, R_cv);
     for (int r = 0; r < 3; r++)
@@ -874,7 +802,7 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
                                   tvec.at<double>(1),
                                   tvec.at<double>(2);
 
-    // ── Assign inlier map points ──────────────────────────────────────────────
+    // assign inlier map points
     for (int i = 0; i < (int)pts3d.size(); ++i)
         if (is_inlier[i])
             frame->map_points[match_idxs[i]] = match_mps[i];
@@ -883,7 +811,7 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
     return true;
 }
 
-// ─── Stereo Epipolar Matching ─────────────────────────────────────────────────
+// stereo epipolar matching
 
 void Tracker::match_stereo(Frame::Ptr frame)
 {
@@ -919,7 +847,7 @@ void Tracker::match_stereo(Frame::Ptr frame)
     }
 }
 
-// ─── Stereo Triangulation ─────────────────────────────────────────────────────
+// stereo triangulation
 
 int Tracker::triangulate_stereo(Frame::Ptr frame)
 {
@@ -951,28 +879,10 @@ int Tracker::triangulate_stereo(Frame::Ptr frame)
     return n_added;
 }
 
-// ─── Post-BA velocity refresh ─────────────────────────────────────────────────
-//
-// After local_ba->optimize() updates keyframe poses and map point positions,
-// the velocity_ stored in the tracker is stale (it was computed from pre-BA
-// PnP estimates).  Re-derive it from the last two BA-refined keyframes so
-// that the next frame's prediction is consistent with the refined map.
+// invalidate velocity after BA — inter-KF delta is a correction, not physical motion
 
 void Tracker::notify_ba_update()
 {
-    // Do NOT re-derive velocity_ from inter-KF poses after BA.
-    //
-    // BA adjusts KF poses using hundreds of new stereo observations added by
-    // insert_keyframe() (triangulate_stereo + multi-KF triangulation).  The
-    // resulting KF-to-KF delta encodes the BA correction, NOT physical camera
-    // motion.  Applying it as velocity_ produces a wildly wrong Phase 1
-    // prediction → Proj-match collapses from ~480 to ~50 → LOST cascade.
-    //
-    // Setting velocity_valid_ = false forces the next frame to predict from
-    // last_frame_->T_cw (the BA-refined most-recent-KF pose) directly.
-    // Since the next frame is physically adjacent to that KF, Phase 1 from
-    // that pose gives ~400+ matches.  After one successful track(), velocity_
-    // re-derives naturally as (frame_N+1 * KF^{-1}) — correct inter-frame.
     velocity_valid_ = false;
 }
 

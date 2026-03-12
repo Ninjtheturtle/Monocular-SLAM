@@ -14,14 +14,12 @@ enum class TrackingState {
     LOST
 };
 
-/// Front-end tracker.
-///
-/// Lifecycle per frame:
-///   1. Extract ORB keypoints + descriptors
-///   2. If not initialized: attempt stereo-like initialization from two frames
-///   3. If tracking: predict pose with constant velocity model, then refine
-///      with GPU-matched map-point re-projections and solvePnPRansac
-///   4. Decide keyframe insertion criterion
+/// front-end tracker. per-frame pipeline:
+///   1. extract ORB keypoints + descriptors
+///   2. if not initialized: stereo single-frame init (or monocular two-frame)
+///   3. if tracking: predict pose with constant velocity, refine with GPU-matched
+///      map-point reprojections and PnP RANSAC
+///   4. decide whether to insert a new keyframe
 class Tracker {
 public:
     struct Config {
@@ -44,20 +42,15 @@ public:
     static Ptr create(const Camera& cam, Map::Ptr map,
                       const Config& cfg = Config{});
 
-    /// Process a new frame. Returns the estimated T_cw pose.
-    /// @param frame  New frame (descriptors already extracted, or will be here)
-    /// @returns true if tracking succeeded
+    /// process a new frame; returns true if tracking succeeded
     bool track(Frame::Ptr frame);
 
     TrackingState state() const { return state_; }
 
-    /// Call after local_ba->optimize() to refresh the constant-velocity
-    /// estimate from the BA-refined keyframe poses.  Without this, velocity_
-    /// would be stale (computed from pre-BA PnP poses), causing the next
-    /// frame's prediction to drift.
+    /// call after BA to invalidate the stale velocity estimate.
+    /// see notify_ba_update() in tracker.cpp for why we don't re-derive velocity_ from BA poses.
     void notify_ba_update();
 
-    // ── Initialization (called internally) ───────────────────────────────────
 private:
     bool initialize(Frame::Ptr frame);
     bool track_with_motion_model(Frame::Ptr frame);
@@ -65,29 +58,27 @@ private:
     bool need_new_keyframe(Frame::Ptr frame) const;
     void insert_keyframe(Frame::Ptr frame);
 
-    /// Run GPU Hamming matcher between two descriptor matrices.
-    /// Returns vector of cv::DMatch (filtered by ratio test).
+    /// GPU Hamming matcher; returns cv::DMatch vector filtered by ratio test
     std::vector<cv::DMatch> match_descriptors(
         const cv::Mat& query_desc,
         const cv::Mat& train_desc,
         bool use_ratio = true
     );
 
-    /// Triangulate points between two frames and add them to the map.
+    /// triangulate points between two frames and add them to the map
     int triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
                             const std::vector<cv::DMatch>& matches);
 
-    /// GPU stereo epipolar matching: fills frame->uR with right x-coords.
+    /// GPU stereo epipolar matching: fills frame->uR with right x-coords
     void match_stereo(Frame::Ptr frame);
 
-    /// Triangulate metric map points from a single stereo frame (frame->uR must be set).
+    /// triangulate metric map points from a single stereo frame (frame->uR must be set)
     int triangulate_stereo(Frame::Ptr frame);
 
-    /// Attempt to recover pose against the full global map when LOST.
-    /// Returns true if >= pnp_min_inliers*3 PnP inliers found.
+    /// attempt to recover pose against the full global map when LOST
     bool try_relocalize(Frame::Ptr frame);
 
-    /// Median angular parallax (radians) of tracked map points between frame and ref_kf.
+    /// median angular parallax (radians) of tracked map points between frame and ref_kf
     double compute_median_parallax(Frame::Ptr frame, Frame::Ptr ref_kf) const;
 
     Camera         cam_;
@@ -100,16 +91,15 @@ private:
     Frame::Ptr last_frame_;
     Frame::Ptr last_keyframe_;
 
-    // PnP-inlier count at the time of the last keyframe insertion.
-    // Stored BEFORE triangulation so the KF ratio test compares like-for-like
-    // (both sides = PnP inliers only, not inflated by triangulated new points).
+    // PnP inlier count at the last KF insertion — saved BEFORE triangulation
+    // so the KF ratio test compares like-for-like (not inflated by new points)
     int last_kf_pnp_tracked_ = 0;
 
-    // Constant velocity motion model
+    // constant velocity motion model
     Eigen::Isometry3d velocity_ = Eigen::Isometry3d::Identity();
     bool velocity_valid_ = false;
 
-    // Consecutive tracking-failure count; only go LOST after ≥3 failures (coasting)
+    // consecutive tracking failures; only go LOST after ≥8 (coasting)
     int lost_streak_ = 0;
 };
 

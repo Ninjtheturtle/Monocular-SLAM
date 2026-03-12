@@ -1,40 +1,17 @@
-// hamming_matcher.cu
-//
-// CUDA kernel for brute-force Hamming-distance matching of ORB descriptors.
-//
-// Algorithm overview
-// ──────────────────
-// Each CUDA block handles exactly ONE query descriptor.  All threads in the
-// block collaborate to compute Hamming distances from that query to every
-// train descriptor, then perform a parallel reduction to find the closest match.
-//
-// Shared-memory layout (per block)
-// ─────────────────────────────────
-//   shm[0..7]   — 8 × uint32_t = 32 bytes = one query descriptor (256 bits)
-//   shm[8+tid]  — per-thread minimum distance accumulator (for reduction)
-//
-// Performance choices
-// ───────────────────
-//   • 256 threads/block — fills 4 warps; gives ~100% occupancy on SM86
-//   • Each thread owns one train descriptor per loop iteration
-//   • Inner loop: 8 × __popc(q[k] ^ t[k]) — fully pipelined on Ampere
-//   • Warp-level reduction using __shfl_down_sync before shared-memory stage
+// brute-force ORB Hamming matcher on CUDA.
+// one block per query; threads stripe over train descriptors, then warp-reduce to best match.
 
 #include "cuda/hamming_matcher.cuh"
 #include <cstring>
 #include <limits>
 #include <vector>
 
-// ─── Kernel: Best-Match (single nearest neighbour) ───────────────────────────
+// kernel: single nearest-neighbour (best match)
 
 static constexpr int BLOCK_SIZE = 256; // threads per block
 
-/// shared memory layout per block:
-///   [0 .. DESC_U32-1]          : query descriptor (8 uint32s)
-///   [DESC_U32 .. DESC_U32+BLOCK_SIZE-1] : per-thread (dist, idx) packed as uint64
-///
-/// We pack (distance << 32 | index) so that a single uint64 min-reduction gives
-/// the correct result (lower distance wins; ties broken by lower index).
+// shm layout: [0..7] = query desc, [8..8+BLOCK_SIZE-1] = per-thread (dist,idx) packed as uint64.
+// packing: (distance << 32 | index) — uint64 min-reduction gives correct result.
 
 __global__ void hamming_match_kernel(
     const uint32_t* __restrict__ d_query,  // (N_q × 8) uint32 row-major
@@ -44,28 +21,27 @@ __global__ void hamming_match_kernel(
     int*  __restrict__ d_best_dist
 )
 {
-    // ── Load query descriptor into shared memory ──────────────────────────────
+    // load query descriptor into shared memory
     extern __shared__ uint32_t shm[];
-    // shm[0..7] = query descriptor
-    // shm[8..8+BLOCK_SIZE-1] = reduction scratch (reused as uint32 distances)
+    // shm[0..7] = query desc, shm[8..] = reduction scratch
 
     const int qid = blockIdx.x;            // one block per query
     const int tid = threadIdx.x;
 
-    // First 8 threads copy one uint32 each of the query descriptor
+    // first 8 threads each copy one uint32 of the query descriptor
     if (tid < kDescUint32) {
         shm[tid] = d_query[qid * kDescUint32 + tid];
     }
     __syncthreads();
 
-    // ── Each thread scans train descriptors in strides of BLOCK_SIZE ──────────
+    // each thread scans train descriptors in strides of BLOCK_SIZE
     int   local_min_dist = kMaxHamming + 1;
     int   local_min_idx  = -1;
 
     for (int t = tid; t < N_t; t += BLOCK_SIZE) {
         const uint32_t* tptr = d_train + t * kDescUint32;
 
-        // Compute Hamming distance: sum of popcount(q XOR t) over 8 words
+        // Hamming distance: sum of popcount(q XOR t) over 8 words
         int dist = 0;
         #pragma unroll
         for (int k = 0; k < kDescUint32; ++k) {
@@ -78,20 +54,19 @@ __global__ void hamming_match_kernel(
         }
     }
 
-    // ── Warp-level reduction (find min across 32 threads) ────────────────────
-    // Pack (dist, idx) into uint64 so a single min() works correctly
-    // (distance in high 32 bits, index in low 32 bits)
+    // warp-level reduction — pack (dist, idx) into uint64 for single min() pass
+    // distance in high 32 bits, index in low 32 bits
     uint64_t val = ((uint64_t)(uint32_t)local_min_dist << 32)
                  | ((uint64_t)(uint32_t)local_min_idx);
 
-    // Butterfly reduction within warp
+    // butterfly reduction within warp
     #pragma unroll
     for (int offset = 16; offset >= 1; offset >>= 1) {
         uint64_t other = __shfl_down_sync(0xFFFFFFFF, val, offset);
         if (other < val) val = other;
     }
 
-    // Lane 0 of each warp writes to shared memory
+    // lane 0 of each warp writes to shared memory
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     __shared__ uint64_t warp_vals[BLOCK_SIZE / 32];  // 8 warps max
@@ -101,7 +76,7 @@ __global__ void hamming_match_kernel(
     }
     __syncthreads();
 
-    // ── Final reduction across warps (thread 0 only) ─────────────────────────
+    // final reduction across warps (thread 0 only)
     if (tid == 0) {
         const int n_warps = BLOCK_SIZE / 32;
         uint64_t best = warp_vals[0];
@@ -113,7 +88,7 @@ __global__ void hamming_match_kernel(
     }
 }
 
-// ─── Kernel: Two-Nearest-Neighbours (for Lowe ratio test) ────────────────────
+// kernel: two nearest neighbours (for Lowe ratio test)
 
 __global__ void hamming_match_ratio_kernel(
     const uint32_t* __restrict__ d_query,
@@ -134,8 +109,8 @@ __global__ void hamming_match_ratio_kernel(
     }
     __syncthreads();
 
-    int local_d1 = kMaxHamming + 1, local_i1 = -1;  // best
-    int local_d2 = kMaxHamming + 1;                  // second best
+    int local_d1 = kMaxHamming + 1, local_i1 = -1;  // best match
+    int local_d2 = kMaxHamming + 1;                  // second-best distance
 
     for (int t = tid; t < N_t; t += BLOCK_SIZE) {
         const uint32_t* tptr = d_train + t * kDescUint32;
@@ -152,8 +127,7 @@ __global__ void hamming_match_ratio_kernel(
         }
     }
 
-    // Warp-reduction for best and second-best simultaneously
-    // We track (d1, i1, d2) per thread; reduce to per-warp minimum
+    // warp reduction for best and second-best simultaneously
     __shared__ int  warp_d1[BLOCK_SIZE / 32];
     __shared__ int  warp_i1[BLOCK_SIZE / 32];
     __shared__ int  warp_d2[BLOCK_SIZE / 32];
@@ -161,7 +135,7 @@ __global__ void hamming_match_ratio_kernel(
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
 
-    // Warp shuffle reduction for best
+    // warp shuffle reduction for best
     #pragma unroll
     for (int offset = 16; offset >= 1; offset >>= 1) {
         int od1 = __shfl_down_sync(0xFFFFFFFF, local_d1, offset);
@@ -199,14 +173,14 @@ __global__ void hamming_match_ratio_kernel(
             if (wd2 < best_d2) best_d2 = wd2;
         }
 
-        // Apply Lowe ratio test
+        // apply Lowe ratio test
         bool accepted = (best_d1 < ratio * best_d2) && (best_i1 >= 0);
         d_best_idx [qid] = accepted ? best_i1 : -1;
         d_best_dist[qid] = accepted ? best_d1 : kMaxHamming;
     }
 }
 
-// ─── Host Wrapper: cuda_match_hamming ─────────────────────────────────────────
+// host wrapper: cuda_match_hamming
 
 void cuda_match_hamming(
     const uint8_t* h_query,
@@ -222,7 +196,7 @@ void cuda_match_hamming(
     const size_t q_bytes = (size_t)N_q * kDescBytes;
     const size_t t_bytes = (size_t)N_t * kDescBytes;
 
-    // Allocate device memory
+    // allocate device memory
     uint32_t *d_query = nullptr, *d_train = nullptr;
     int      *d_idx   = nullptr, *d_dist  = nullptr;
 
@@ -231,15 +205,14 @@ void cuda_match_hamming(
     CUDA_CHECK(cudaMalloc(&d_idx,   sizeof(int) * N_q));
     CUDA_CHECK(cudaMalloc(&d_dist,  sizeof(int) * N_q));
 
-    // Copy descriptors to device
+    // copy descriptors to device
     CUDA_CHECK(cudaMemcpy(d_query, h_query, q_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_train, h_train, t_bytes, cudaMemcpyHostToDevice));
 
-    // Shared memory: 8 uint32 for query desc + warp_vals array (8 uint64)
-    // Total: 32 + 64 = 96 bytes per block (well within limits)
+    // shared memory: 8 uint32 for query desc (32 bytes per block)
     const size_t shm_bytes = kDescUint32 * sizeof(uint32_t);
 
-    // Launch: one block per query descriptor
+    // launch: one block per query descriptor
     dim3 grid(N_q, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     hamming_match_kernel<<<grid, block, shm_bytes>>>(
@@ -248,22 +221,19 @@ void cuda_match_hamming(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Copy results back
+    // copy results back
     CUDA_CHECK(cudaMemcpy(h_best_idx,  d_idx,  sizeof(int) * N_q, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_best_dist, d_dist, sizeof(int) * N_q, cudaMemcpyDeviceToHost));
 
-    // Free device memory
+    // free device memory
     CUDA_CHECK(cudaFree(d_query));
     CUDA_CHECK(cudaFree(d_train));
     CUDA_CHECK(cudaFree(d_idx));
     CUDA_CHECK(cudaFree(d_dist));
 }
 
-// ─── Kernel: Stereo Epipolar Matching ────────────────────────────────────────
-//
-// Identical to hamming_match_ratio_kernel but each thread first checks the
-// epipolar and disparity constraints before computing Hamming distance.
-// Skipped train descriptors are treated as infinite distance (never win).
+// kernel: stereo epipolar matching
+// same as ratio kernel but skips train descriptors that fail the epipolar/disparity check.
 
 __global__ void hamming_stereo_kernel(
     const uint32_t* __restrict__ d_query,
@@ -298,7 +268,7 @@ __global__ void hamming_stereo_kernel(
     int local_d2 = kMaxHamming + 1;
 
     for (int t = tid; t < N_t; t += BLOCK_SIZE) {
-        // Epipolar and disparity constraint
+        // epipolar and disparity constraint
         float dy   = y_q - d_y_train[t];
         if (dy < 0.0f) dy = -dy;
         if (dy > epi_tol) continue;
@@ -367,7 +337,7 @@ __global__ void hamming_stereo_kernel(
     }
 }
 
-// ─── Host Wrapper: cuda_match_hamming_ratio ───────────────────────────────────
+// host wrapper: cuda_match_hamming_ratio
 
 void cuda_match_hamming_ratio(
     const uint8_t* h_query,
@@ -414,7 +384,7 @@ void cuda_match_hamming_ratio(
     CUDA_CHECK(cudaFree(d_dist));
 }
 
-// ─── Host Wrapper: cuda_match_stereo_epipolar ─────────────────────────────────
+// host wrapper: cuda_match_stereo_epipolar
 
 void cuda_match_stereo_epipolar(
     const uint8_t* h_query,

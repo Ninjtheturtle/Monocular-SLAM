@@ -1,14 +1,4 @@
-// pose_graph.cpp
-//
-// Pose Graph Optimization using co-visibility loop detection.
-//
-// Each edge stores the relative transform T_AB = T_A_cw * T_B_cw.inverse()
-// (measured after local BA).  The PGO residual is the SE(3) log of the error:
-//
-//   delta = T_AB_meas * T_B_est * T_A_est.inverse()
-//
-// which should be Identity at optimum.  The 6-DOF residual is
-// [w_r * omega_delta (3), w_t * t_delta (3)].
+// pose graph optimization over co-visibility loop edges.
 
 #include "slam/pose_graph.hpp"
 
@@ -23,7 +13,7 @@
 
 namespace slam {
 
-// ─── Relative Pose Cost (auto-diff, 6 residuals) ─────────────────────────────
+// relative pose cost (auto-diff, 6 residuals)
 
 struct RelPoseCost {
     double R_meas[9];  // row-major rotation of T_AB_meas
@@ -34,7 +24,7 @@ struct RelPoseCost {
     template <typename T>
     bool operator()(const T* const pa, const T* const pb, T* res) const
     {
-        // Rotation matrices from angle-axis vectors
+        // rotation matrices from angle-axis vectors
         T Ra[9], Rb[9];
         ceres::AngleAxisToRotationMatrix(pa, Ra);
         ceres::AngleAxisToRotationMatrix(pb, Rb);
@@ -42,7 +32,7 @@ struct RelPoseCost {
         const T* ta = pa + 3;
         const T* tb = pb + 3;
 
-        // Cast measurement (double → T)
+        // cast measurement (double → T)
         T Rm[9], tm[3];
         for (int i = 0; i < 9; ++i) Rm[i] = T(R_meas[i]);
         for (int i = 0; i < 3; ++i) tm[i] = T(t_meas[i]);
@@ -96,7 +86,7 @@ struct RelPoseCost {
     }
 };
 
-// ─── Pose helpers ─────────────────────────────────────────────────────────────
+// pose helpers
 
 static void isometry_to_pose(const Eigen::Isometry3d& T, double* pose)
 {
@@ -119,7 +109,7 @@ static Eigen::Isometry3d pose_to_isometry(const double* pose)
     return T;
 }
 
-// ─── PoseGraph implementation ─────────────────────────────────────────────────
+// PoseGraph implementation
 
 PoseGraph::Ptr PoseGraph::create(Map::Ptr map, const Camera& cam, const Config& cfg)
 {
@@ -142,7 +132,7 @@ void PoseGraph::detect_and_add_loops()
 
     Frame::Ptr query = kf_order_.back();
 
-    // Collect IDs of KFs currently inside the local BA window (exclude from loop search)
+    // collect IDs of KFs inside the local BA window (skip them for loop search)
     std::unordered_set<long> window_ids;
     for (auto& kf : map_->local_window())
         window_ids.insert(kf->id);
@@ -154,10 +144,10 @@ void PoseGraph::detect_and_add_loops()
         int shared = map_->count_shared_map_points(kf->id, query->id);
         if (shared < cfg_.min_shared_points) continue;
 
-        // Compute relative pose T_AB = T_A_cw * T_B_cw.inverse()
+        // compute relative pose T_AB = T_A_cw * T_B_cw.inverse()
         Eigen::Isometry3d T_AB = kf->T_cw * query->T_cw.inverse();
 
-        // Extract R (row-major) and t
+        // extract R (row-major) and t
         Edge e;
         e.id_a = kf->id;
         e.id_b = query->id;
@@ -183,7 +173,7 @@ void PoseGraph::optimize()
     auto all_kfs = map_->all_keyframes();
     if (all_kfs.size() < 2 || edges_.empty()) return;
 
-    // Allocate pose parameter blocks (one 6-vector per KF)
+    // allocate pose parameter blocks (one 6-vector per KF)
     std::unordered_map<long, std::vector<double>> pose_params;
     for (auto& kf : all_kfs) {
         pose_params[kf->id].resize(6);
@@ -192,7 +182,7 @@ void PoseGraph::optimize()
 
     ceres::Problem problem;
 
-    // Add relative-pose edges
+    // add relative-pose edges
     for (auto& e : edges_) {
         auto it_a = pose_params.find(e.id_a);
         auto it_b = pose_params.find(e.id_b);
@@ -207,7 +197,7 @@ void PoseGraph::optimize()
 
     if (problem.NumResidualBlocks() == 0) return;
 
-    // Register all parameter blocks and fix oldest KF as gauge anchor
+    // register all parameter blocks and fix oldest KF as gauge anchor
     for (auto& kf : all_kfs)
         problem.AddParameterBlock(pose_params[kf->id].data(), 6);
     problem.SetParameterBlockConstant(pose_params[all_kfs.front()->id].data());
@@ -221,7 +211,7 @@ void PoseGraph::optimize()
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    // Write back optimised poses
+    // write back optimized poses
     for (auto& kf : all_kfs) {
         auto it = pose_params.find(kf->id);
         if (it != pose_params.end())
@@ -235,23 +225,10 @@ void PoseGraph::optimize()
     new_loops_ = false;  // reset until next detection round
 }
 
-// ─── Appearance-based (descriptor) loop detection ────────────────────────────
-//
-// For each KF outside the local BA window (sampled every visual_sample_step),
-// match its ORB descriptors against the query KF using BFMatcher + ratio test.
-// If enough descriptors match, run PnP RANSAC using the candidate KF's 3D map
-// points against the query KF's 2D keypoints to verify geometrically.
-// A loop edge is added if PnP inliers >= cfg_.visual_min_inliers.
-//
-// This works even when old map points have no late-frame observations (the
-// fundamental limitation of co-visibility detection), because it matches
-// appearance descriptors directly across arbitrary KF pairs.
+// appearance-based loop detection (disabled — needs a visual vocabulary like DBoW)
 
 void PoseGraph::detect_and_add_loops_visual(Frame::Ptr /*query*/)
 {
-    // Visual loop detection disabled: raw BFMatcher produces false-positive
-    // loop edges on repetitive scenes (KITTI urban) even with PnP verification.
-    // Re-enable only when a proper visual vocabulary (DBoW) is available.
 }
 
 }  // namespace slam
