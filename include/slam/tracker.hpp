@@ -41,7 +41,7 @@ public:
         // XFeat / feature extraction
         int   max_keypoints      = 2000;
         float anms_min_response  = 0.005f;
-        float l2_ratio           = 0.9f;   // Lowe ratio for FP16 L2 matching
+        float l2_ratio           = 0.8f;   // Lowe ratio for FP16 L2 matching
 
         // Legacy ORB fields retained for monocular fallback and init
         int   orb_features       = 2000;
@@ -52,7 +52,7 @@ public:
         float lowe_ratio         = 0.75f;
 
         int   min_tracked_points = 80;
-        int   pnp_iterations     = 200;
+        int   pnp_iterations     = 500;
         float pnp_reprojection   = 5.5f;
         int   pnp_min_inliers    = 15;
         float stereo_epi_tol     = 2.0f;
@@ -101,6 +101,11 @@ private:
 
     // Ensures device L2 matching buffers have capacity for N_q × N_t descriptors.
     void ensure_l2_buffers(int N_q, int N_t);
+
+    // Logs keypoint grid occupancy to stderr for spatial distribution diagnosis.
+    void log_anms_grid_stats(const std::vector<cv::KeyPoint>& kps,
+                             int img_w, int img_h,
+                             int grid_cols, int grid_rows) const;
 
     // FP16 L2 matching using XFeat descriptors.
     // Outputs matches with confidence weights in frame->match_confidence.
@@ -161,6 +166,11 @@ private:
     int*    d_best_idx_    = nullptr;
     float*  d_best_dist_   = nullptr;
     float*  d_pseudo_conf_ = nullptr;
+    // Coordinate buffers for the stereo epipolar kernel
+    float*  d_y_q_         = nullptr;
+    float*  d_y_t_         = nullptr;
+    float*  d_x_q_         = nullptr;
+    float*  d_x_t_         = nullptr;
     int     d_buf_capacity_ = 0;  // number of descriptors each buffer can hold
 
     Frame::Ptr last_frame_;

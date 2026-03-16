@@ -45,3 +45,21 @@ void cuda_match_l2_fp16(
     float* d_pseudo_conf,
     cudaStream_t stream = 0
 );
+
+// Stereo variant: enforces |y_q-y_t| <= epi_tol and d_min <= (x_q-x_t) <= d_max
+// inside the GPU kernel before computing L2, so only epipolar-compliant right-frame
+// descriptors compete. Mirrors cuda_match_stereo_epipolar() for the FP16 L2 path.
+void cuda_match_l2_stereo_epipolar(
+    const __half* d_query,
+    const __half* d_train,
+    const float*  d_y_q,
+    const float*  d_y_t,
+    const float*  d_x_q,
+    const float*  d_x_t,
+    int N_q, int N_t, int D,
+    float epi_tol, float d_min, float d_max, float ratio,
+    int*   d_best_idx,
+    float* d_best_dist,
+    float* d_pseudo_conf,
+    cudaStream_t stream = 0
+);

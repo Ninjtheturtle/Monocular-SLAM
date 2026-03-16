@@ -388,6 +388,31 @@ struct PitchRollCost {
     }
 };
 
+/// Ground-plane height constraint: penalizes camera Y deviating from reference height.
+/// For a car on flat ground, camera height should remain approximately constant.
+struct GroundHeightCost {
+    double y_ref;   // reference camera-center Y (world frame)
+    double w_h;     // weight
+
+    template <typename T>
+    bool operator()(const T* const pose, T* residuals) const {
+        // Camera center in world frame: C = -R^T * t
+        // Ceres AngleAxisToRotationMatrix outputs column-major R:
+        //   R[0..2] = col0, R[3..5] = col1, R[6..8] = col2
+        // Camera center Y = -(R[1]*t0 + R[4]*t1 + R[7]*t2)
+        T R[9];
+        ceres::AngleAxisToRotationMatrix(pose, R);
+        T cy = -(R[1] * pose[3] + R[4] * pose[4] + R[7] * pose[5]);
+        residuals[0] = T(w_h) * (cy - T(y_ref));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double y_ref, double w_h) {
+        auto* c = new GroundHeightCost{y_ref, w_h};
+        return new ceres::AutoDiffCostFunction<GroundHeightCost, 1, 6>(c);
+    }
+};
+
 // pose prior — soft anchor to the pre-BA PnP estimate so sparse KFs don't drift.
 struct PosePriorCost {
     double prior[6];
@@ -484,18 +509,8 @@ void LocalBA::optimize() {
                   prior_poses[kf->id].begin());
     }
 
-    // 4. build Ceres problem — tighten Huber at sharp turns to downweight distant features
+    // 4. build Ceres problem
     double effective_huber = cfg_.huber_delta;
-    if (window.size() >= 2) {
-        const auto& kf_last = window.back();
-        const auto& kf_prev = window[window.size() - 2];
-        Eigen::Isometry3d T_rel = kf_last->T_cw * kf_prev->T_cw.inverse();
-        double kf_angle = Eigen::AngleAxisd(T_rel.rotation()).angle();
-        if (kf_angle > 0.05) {
-            // sharp turn: halve Huber threshold to reject noisy distant features
-            effective_huber = cfg_.huber_delta * 0.5;
-        }
-    }
 
     ceres::Problem problem;
     ceres::LossFunction* loss = new ceres::HuberLoss(effective_huber);
@@ -517,6 +532,16 @@ void LocalBA::optimize() {
             double w = 1.0;
             if (kp_idx < (int)kf->match_confidence.size())
                 w = std::max(0.01, (double)kf->match_confidence[kp_idx]);
+
+            // Distant points anchor yaw; floor their weight so the optimizer
+            // cannot down-weight them to near-zero even if L2 confidence is low.
+            {
+                double Xc[3];
+                ceres::AngleAxisRotatePoint(pose, pt, Xc);
+                Xc[0] += pose[3]; Xc[1] += pose[4]; Xc[2] += pose[5];
+                if (Xc[2] > 40.0)
+                    w = std::max(w, 0.5);
+            }
 
             // use stereo cost (3 residuals) when a valid right-image observation exists
             if (cam_.is_stereo() && kp_idx < (int)kf->uR.size() && kf->uR[kp_idx] >= 0.0f) {
@@ -545,20 +570,25 @@ void LocalBA::optimize() {
     }
 
     // pitch/roll soft constraint (stereo only)
+    // w_rp=100: strong pitch/roll constraint (gravity-aligned); yaw left free for BA
     if (cam_.is_stereo()) {
         for (auto& kf : window) {
             if (kf == window.front()) continue;
-            problem.AddResidualBlock(PitchRollCost::Create(30.0), nullptr,
+            problem.AddResidualBlock(PitchRollCost::Create(50.0), nullptr,
                                      pose_params[kf->id].data());
         }
     }
 
-    // pose prior for each non-anchor KF
+    // ground-height constraint DISABLED — KITTI 00 has 25m elevation change;
+    // absolute height constraint distorts BA and causes Y-drift instability.
+    // Stereo reprojection residuals already constrain Y via depth observations.
+
+    // pose prior — translation-only anchor; w_r=0.0 (no rotation prior) frees yaw for BA
     for (auto& kf : window) {
-        if (kf == window.front()) continue;  // anchor is fixed — skip
+        if (kf == window.front()) continue;
         auto it = prior_poses.find(kf->id);
         if (it == prior_poses.end()) continue;
-        problem.AddResidualBlock(PosePriorCost::Create(it->second.data(), 0.5, 0.5), nullptr,
+        problem.AddResidualBlock(PosePriorCost::Create(it->second.data(), 0.0, 2.0), nullptr,
                                  pose_params[kf->id].data());
     }
 
@@ -577,9 +607,20 @@ void LocalBA::optimize() {
         std::cout << summary.BriefReport() << "\n";
     }
 
-    // 6. write back optimized poses
+    // 6. write back optimized poses + log yaw correction
     for (auto& kf : window) {
+        Eigen::Isometry3d T_old = kf->T_cw;
         kf->T_cw = pose_to_isometry(pose_params[kf->id].data());
+        // diagnostic: BA yaw correction magnitude
+        Eigen::Matrix3d R_wc_old = T_old.inverse().rotation();
+        Eigen::Matrix3d R_wc_new = kf->T_cw.inverse().rotation();
+        double yaw_old = std::atan2(R_wc_old(0, 2), R_wc_old(0, 0)) * 180.0 / 3.14159265358979323846;
+        double yaw_new = std::atan2(R_wc_new(0, 2), R_wc_new(0, 0)) * 180.0 / 3.14159265358979323846;
+        double delta_yaw = yaw_new - yaw_old;
+        while (delta_yaw >  180.0) delta_yaw -= 360.0;
+        while (delta_yaw < -180.0) delta_yaw += 360.0;
+        if (std::abs(delta_yaw) > 0.01)
+            fprintf(stderr, "[BA-DIAG] kf=%ld delta_yaw=%.4f deg\n", kf->id, delta_yaw);
     }
 
     // 7. write back optimized 3D point positions
@@ -610,9 +651,9 @@ void LocalBA::optimize() {
                     continue;
                 }
 
-                // cull stereo points beyond 150m — depth is unreliable at that range
+                // cull stereo points beyond 80m — depth is unreliable at that range
                 if (cam_.is_stereo() && kp_idx < (int)kf->uR.size() && kf->uR[kp_idx] >= 0.0f &&
-                    Xc[2] > 150.0) {
+                    Xc[2] > 80.0) {
                     mp->is_bad = true;
                     continue;
                 }

@@ -129,30 +129,46 @@ void Tracker::extract_features_hybrid(Frame::Ptr frame)
         frame->uR.assign(res.N, -1.0f);
         if (res.N > 0 && res_r.N > 0 && res.descriptors_pinned && res_r.descriptors_pinned) {
             ensure_l2_buffers(res.N, res_r.N);
+
+            // Upload descriptors
             cudaMemcpy(d_query_descs_, res.descriptors_pinned,
                        res.N * deep::kXFeatDescDim * sizeof(__half), cudaMemcpyHostToDevice);
             cudaMemcpy(d_train_descs_, res_r.descriptors_pinned,
                        res_r.N * deep::kXFeatDescDim * sizeof(__half), cudaMemcpyHostToDevice);
 
-            cuda_match_l2_fp16(d_query_descs_, d_train_descs_,
-                                res.N, res_r.N, deep::kXFeatDescDim,
-                                cfg_.l2_ratio,
-                                d_best_idx_, d_best_dist_, d_pseudo_conf_,
-                                /*stream=*/0);
+            // Upload keypoint coordinates for in-kernel epipolar gate
+            std::vector<float> y_q(res.N), x_q(res.N);
+            for (int i = 0; i < res.N; ++i) {
+                y_q[i] = frame->keypoints[i].pt.y;
+                x_q[i] = frame->keypoints[i].pt.x;
+            }
+            std::vector<float> y_t(res_r.N), x_t(res_r.N);
+            for (int i = 0; i < res_r.N; ++i) {
+                y_t[i] = frame->keypoints_right[i].pt.y;
+                x_t[i] = frame->keypoints_right[i].pt.x;
+            }
+            cudaMemcpy(d_y_q_, y_q.data(), res.N   * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_x_q_, x_q.data(), res.N   * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_y_t_, y_t.data(), res_r.N * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_x_t_, x_t.data(), res_r.N * sizeof(float), cudaMemcpyHostToDevice);
+
+            cuda_match_l2_stereo_epipolar(
+                d_query_descs_, d_train_descs_,
+                d_y_q_, d_y_t_, d_x_q_, d_x_t_,
+                res.N, res_r.N, deep::kXFeatDescDim,
+                cfg_.stereo_epi_tol, cfg_.stereo_d_min, cfg_.stereo_d_max,
+                cfg_.l2_ratio,
+                d_best_idx_, d_best_dist_, d_pseudo_conf_,
+                /*stream=*/0);
             cudaDeviceSynchronize();
 
-            std::vector<int>   best_idx(res.N);
-            std::vector<float> best_conf(res.N);
-            cudaMemcpy(best_idx.data(), d_best_idx_,    res.N*sizeof(int),   cudaMemcpyDeviceToHost);
-            cudaMemcpy(best_conf.data(), d_pseudo_conf_, res.N*sizeof(float), cudaMemcpyDeviceToHost);
+            std::vector<int> best_idx(res.N);
+            cudaMemcpy(best_idx.data(), d_best_idx_, res.N * sizeof(int), cudaMemcpyDeviceToHost);
 
+            // Kernel already enforces epipolar + disparity bounds; just store matches.
             for (int i = 0; i < res.N; ++i) {
                 int j = best_idx[i];
                 if (j < 0) continue;
-                float dy   = std::abs(frame->keypoints[i].pt.y - frame->keypoints_right[j].pt.y);
-                float disp = frame->keypoints[i].pt.x - frame->keypoints_right[j].pt.x;
-                if (dy > cfg_.stereo_epi_tol) continue;
-                if (disp < cfg_.stereo_d_min || disp > cfg_.stereo_d_max) continue;
                 frame->uR[i] = frame->keypoints_right[j].pt.x;
             }
         }
@@ -169,6 +185,8 @@ void Tracker::ensure_l2_buffers(int N_q, int N_t)
 
     cudaFree(d_query_descs_); cudaFree(d_train_descs_);
     cudaFree(d_best_idx_);    cudaFree(d_best_dist_); cudaFree(d_pseudo_conf_);
+    cudaFree(d_y_q_); cudaFree(d_y_t_);
+    cudaFree(d_x_q_); cudaFree(d_x_t_);
 
     int cap = needed + 512;
     cudaMalloc(&d_query_descs_, cap * deep::kXFeatDescDim * sizeof(__half));
@@ -176,6 +194,10 @@ void Tracker::ensure_l2_buffers(int N_q, int N_t)
     cudaMalloc(&d_best_idx_,    cap * sizeof(int));
     cudaMalloc(&d_best_dist_,   cap * sizeof(float));
     cudaMalloc(&d_pseudo_conf_, cap * sizeof(float));
+    cudaMalloc(&d_y_q_,         cap * sizeof(float));
+    cudaMalloc(&d_y_t_,         cap * sizeof(float));
+    cudaMalloc(&d_x_q_,         cap * sizeof(float));
+    cudaMalloc(&d_x_t_,         cap * sizeof(float));
     d_buf_capacity_ = cap;
 }
 
@@ -675,7 +697,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
             ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
         const float base_r = velocity_valid_ ? 40.0f : 70.0f;
         const float search_r = (pred_ang > 0.03)
-            ? std::min(120.0f, base_r + float(pred_ang / 0.03) * 20.0f)
+            ? std::min(150.0f, base_r + float(pred_ang / 0.03) * 20.0f)
             : base_r;
         const int   max_ham  = cfg_.hamming_threshold;
 
@@ -700,8 +722,9 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
             int cy0 = std::max(0,            (int)((v - search_r) / cell));
             int cy1 = std::min(n_rows_g - 1, (int)((v + search_r) / cell));
 
-            int best_j = -1;
-            float best_d = hybrid_mode_ ? 0.8f : float(max_ham + 1);
+            int   best_j   = -1,  second_j = -1;
+            float best_d   = hybrid_mode_ ? 0.6f : float(max_ham + 1);
+            float second_d = best_d;
             const cv::Mat& frame_descs = hybrid_mode_ ? frame->xfeat_descriptors
                                                        : frame->descriptors;
             for (int gy = cy0; gy <= cy1; ++gy)
@@ -720,12 +743,23 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                                                 frame_descs.row(kp_j),
                                                 cv::NORM_HAMMING);
                         }
-                        if (d < best_d) { best_d = d; best_j = kp_j; }
+                        if (d < best_d) {
+                            second_d = best_d; second_j = best_j;
+                            best_d = d; best_j = kp_j;
+                        } else if (d < second_d) {
+                            second_d = d; second_j = kp_j;
+                        }
                     }
 
             if (best_j < 0) continue;
+            // Lowe ratio test for hybrid mode — rejects ambiguous spatial matches
+            if (hybrid_mode_ && second_j >= 0 && best_d > 0.75f * second_d) continue;
             if (!used_kp.insert(best_j).second) continue;
             auto& p = mp->position;
+            // Propagate pseudo-confidence from ratio test into match_confidence for BA weighting
+            if (hybrid_mode_ && best_j < (int)frame->match_confidence.size() && second_j >= 0)
+                frame->match_confidence[best_j] =
+                    std::max(0.1f, std::min(1.0f, 1.f - best_d / second_d));
             pts3d.push_back({(float)p.x(), (float)p.y(), (float)p.z()});
             pts2d.push_back(frame->keypoints[best_j].pt);
             match_idxs.push_back(best_j);
@@ -773,10 +807,9 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         tvec.at<double>(1) = frame->T_cw.translation().y();
         tvec.at<double>(2) = frame->T_cw.translation().z();
     }
-    // skip initial guess at sharp turns — overshoots bias RANSAC (threshold: 0.3 rad ≈ 17°)
     const double pred_angle = velocity_valid_
         ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
-    const bool use_guess = velocity_valid_ && (pred_angle < 0.3);
+    const bool use_guess = velocity_valid_ && (pred_angle < 0.5);
 
     bool ok = cv::solvePnPRansac(
         pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(),
@@ -842,6 +875,20 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         }
     }
 
+    // velocity prediction diagnostic: compare predicted yaw vs committed yaw
+    {
+        Eigen::Matrix3d R_wc_pred = frame->T_cw.inverse().rotation();
+        Eigen::Matrix3d R_wc_commit = T_cw_candidate.inverse().rotation();
+        double yaw_pred   = std::atan2(R_wc_pred(0, 2), R_wc_pred(0, 0)) * 180.0 / 3.14159265358979323846;
+        double yaw_commit = std::atan2(R_wc_commit(0, 2), R_wc_commit(0, 0)) * 180.0 / 3.14159265358979323846;
+        double vel_err = yaw_commit - yaw_pred;
+        while (vel_err >  180.0) vel_err -= 360.0;
+        while (vel_err < -180.0) vel_err += 360.0;
+        if (std::abs(vel_err) > 0.05)
+            fprintf(stderr, "[VEL-DIAG] pred_yaw=%.2f commit_yaw=%.2f err=%.2f deg\n",
+                    yaw_pred, yaw_commit, vel_err);
+    }
+
     // commit pose
     frame->T_cw = T_cw_candidate;
 
@@ -876,12 +923,15 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         for (auto& mp : pool_mps) proj_seen.insert(mp->id);
 
         for (auto& kf : map_->local_window(30)) {
-            if (kf->descriptors.empty()) continue;
+            const bool kf_has_desc = hybrid_mode_ ? !kf->xfeat_descriptors.empty()
+                                                   : !kf->descriptors.empty();
+            if (!kf_has_desc) continue;
             for (int i = 0; i < (int)kf->map_points.size(); ++i) {
                 auto& mp = kf->map_points[i];
                 if (!mp || mp->is_bad) continue;
                 if (!proj_seen.insert(mp->id).second) continue;  // already tried
-                if (i >= kf->descriptors.rows) continue;
+                if (hybrid_mode_ ? (i >= kf->xfeat_descriptors.rows)
+                                 : (i >= kf->descriptors.rows)) continue;
 
                 // project into frame using committed T_cw
                 Eigen::Vector3d Xc = frame->T_cw * mp->position;
@@ -896,15 +946,29 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                 int cy0 = std::max(0,            (int)((v - search_r) / cell));
                 int cy1 = std::min(n_rows_g - 1, (int)((v + search_r) / cell));
 
-                int best_j = -1, best_d = max_ham;
-                for (int gy = cy0; gy <= cy1; ++gy)
-                    for (int gx = cx0; gx <= cx1; ++gx)
-                        for (int kp_j : kp_grid[gy * n_cols_g + gx]) {
-                            int d = cv::norm(kf->descriptors.row(i),
-                                            frame->descriptors.row(kp_j),
-                                            cv::NORM_HAMMING);
-                            if (d < best_d) { best_d = d; best_j = kp_j; }
-                        }
+                int best_j = -1;
+                if (hybrid_mode_) {
+                    float best_l2 = 0.6f;
+                    for (int gy = cy0; gy <= cy1; ++gy)
+                        for (int gx = cx0; gx <= cx1; ++gx)
+                            for (int kp_j : kp_grid[gy * n_cols_g + gx]) {
+                                if (kp_j >= frame->xfeat_descriptors.rows) continue;
+                                float d = (float)cv::norm(kf->xfeat_descriptors.row(i),
+                                                          frame->xfeat_descriptors.row(kp_j),
+                                                          cv::NORM_L2);
+                                if (d < best_l2) { best_l2 = d; best_j = kp_j; }
+                            }
+                } else {
+                    int best_ham = max_ham;
+                    for (int gy = cy0; gy <= cy1; ++gy)
+                        for (int gx = cx0; gx <= cx1; ++gx)
+                            for (int kp_j : kp_grid[gy * n_cols_g + gx]) {
+                                int d = cv::norm(kf->descriptors.row(i),
+                                                frame->descriptors.row(kp_j),
+                                                cv::NORM_HAMMING);
+                                if (d < best_ham) { best_ham = d; best_j = kp_j; }
+                            }
+                }
 
                 if (best_j < 0 || used_kp.count(best_j)) continue;
 
@@ -919,7 +983,25 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         }
     }
 
-    velocity_       = frame->T_cw * last_frame_->T_cw.inverse();
+    // EMA-smoothed velocity: blend new raw velocity with previous estimate
+    // Adaptive alpha: trust current measurement more during turns to reduce lag
+    {
+        Eigen::Isometry3d raw_vel = frame->T_cw * last_frame_->T_cw.inverse();
+        if (velocity_valid_) {
+            double raw_angle = Eigen::AngleAxisd(raw_vel.rotation()).angle();
+            const double alpha = (raw_angle > 0.01) ? 0.85 : 0.6;
+            Eigen::Quaterniond q_old(velocity_.rotation());
+            Eigen::Quaterniond q_new(raw_vel.rotation());
+            Eigen::Quaterniond q_smooth = q_old.slerp(alpha, q_new);
+            Eigen::Vector3d t_smooth = (1.0 - alpha) * velocity_.translation()
+                                     + alpha * raw_vel.translation();
+            velocity_ = Eigen::Isometry3d::Identity();
+            velocity_.linear() = q_smooth.toRotationMatrix();
+            velocity_.translation() = t_smooth;
+        } else {
+            velocity_ = raw_vel;
+        }
+    }
     velocity_valid_ = true;
     return true;
 }
@@ -946,6 +1028,14 @@ bool Tracker::need_new_keyframe(Frame::Ptr frame) const
     if (tracked < cfg_.min_tracked_points) return true;
     if (last_kf_pnp_tracked_ > 0 && (float)tracked / last_kf_pnp_tracked_ < 0.8f) return true;
 
+    // rotation-based trigger: insert KF when cumulative rotation since last KF exceeds ~2.9°
+    // ensures dense KF coverage during turns for better BA constraints
+    if (last_keyframe_) {
+        Eigen::Isometry3d delta = frame->T_cw * last_keyframe_->T_cw.inverse();
+        double angle = Eigen::AngleAxisd(delta.rotation()).angle();
+        if (angle > 0.05) return true;
+    }
+
     return false;
 }
 
@@ -968,8 +1058,36 @@ double Tracker::compute_median_parallax(Frame::Ptr frame, Frame::Ptr ref_kf) con
     return angles[angles.size() / 2];
 }
 
+void Tracker::log_anms_grid_stats(const std::vector<cv::KeyPoint>& kps,
+                                  int img_w, int img_h,
+                                  int grid_cols, int grid_rows) const
+{
+    std::vector<int> counts(grid_cols * grid_rows, 0);
+    for (const auto& kp : kps) {
+        int col = std::min((int)(kp.pt.x / img_w * grid_cols), grid_cols - 1);
+        int row = std::min((int)(kp.pt.y / img_h * grid_rows), grid_rows - 1);
+        ++counts[row * grid_cols + col];
+    }
+    float mean = (float)kps.size() / counts.size();
+    float var = 0.f;
+    for (int c : counts) var += (c - mean) * (c - mean);
+    float cv = std::sqrt(var / counts.size()) / (mean + 1e-6f);
+    fprintf(stderr, "[ANMS] %d pts | grid %dx%d | mean/cell=%.1f | CoV=%.2f\n",
+            (int)kps.size(), grid_cols, grid_rows, mean, cv);
+    for (int r = 0; r < grid_rows; ++r) {
+        int row_total = 0;
+        for (int c = 0; c < grid_cols; ++c) row_total += counts[r * grid_cols + c];
+        fprintf(stderr, "  row%d: %d pts (%.0f%%)\n",
+                r, row_total, 100.f * row_total / ((int)kps.size() + 1));
+    }
+}
+
 void Tracker::insert_keyframe(Frame::Ptr frame)
 {
+    // Log ANMS spatial distribution on every keyframe for pitch-bias diagnosis
+    if (cam_.width > 0 && !frame->keypoints.empty())
+        log_anms_grid_stats(frame->keypoints, cam_.width, cam_.height, 6, 4);
+
     // save PnP inlier count BEFORE triangulation inflates frame->map_points
     last_kf_pnp_tracked_ = frame->num_tracked();
 
@@ -1116,7 +1234,7 @@ int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
         Eigen::Vector3d Xc0 = ref->T_cw * Xw;
         Eigen::Vector3d Xc1 = cur->T_cw * Xw;
         if (Xc0.z() < 0.05 || Xc1.z() < 0.05) continue;
-        if (Xc0.z() > 200.0 || Xc1.z() > 200.0) continue;
+        if (Xc0.z() > 80.0 || Xc1.z() > 80.0) continue;
 
         // skip near-degenerate triangulations (cos_pa > 0.9998 ≈ <1.1° parallax)
         {
@@ -1302,7 +1420,7 @@ int Tracker::triangulate_stereo(Frame::Ptr frame)
         double Z = cam_.fx * cam_.baseline / (double)d;
         double X = ((double)u_L - cam_.cx) * Z / cam_.fx;
         double Y = ((double)v_L - cam_.cy) * Z / cam_.fy;
-        if (Z < 0.5 || Z > 150.0) continue;
+        if (Z < 0.5 || Z > 80.0) continue;  // cap at 80m — far stereo has poor depth
 
         Eigen::Vector3d Xw = frame->T_cw.inverse() * Eigen::Vector3d(X, Y, Z);
 
@@ -1315,11 +1433,31 @@ int Tracker::triangulate_stereo(Frame::Ptr frame)
     return n_added;
 }
 
-// invalidate velocity after BA — inter-KF delta is a correction, not physical motion
-
+// re-derive velocity from BA-corrected keyframes, scaled to per-frame interval
 void Tracker::notify_ba_update()
 {
-    velocity_valid_ = false;
+    auto window = map_->local_window(3);
+    if (window.size() >= 2) {
+        // Use the most temporally separated KFs for a stable estimate
+        auto& kf_old = window.front();
+        auto& kf_new = window.back();
+        double dt = kf_new->timestamp - kf_old->timestamp;
+        if (dt > 1e-6) {
+            Eigen::Isometry3d total_delta = kf_new->T_cw * kf_old->T_cw.inverse();
+            double frame_dt = 0.1;  // ~10 Hz KITTI
+            double scale = frame_dt / dt;
+            Eigen::AngleAxisd aa(total_delta.rotation());
+            velocity_ = Eigen::Isometry3d::Identity();
+            if (aa.angle() > 1e-9)
+                velocity_.linear() = Eigen::AngleAxisd(aa.angle() * scale, aa.axis()).toRotationMatrix();
+            velocity_.translation() = total_delta.translation() * scale;
+            velocity_valid_ = true;
+        } else {
+            velocity_valid_ = false;
+        }
+    } else {
+        velocity_valid_ = false;
+    }
 }
 
 }  // namespace slam

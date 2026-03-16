@@ -185,6 +185,35 @@ static std::vector<std::array<float, 3>> load_gt_centers(const std::string& path
     return out;
 }
 
+// load KITTI pose file — returns full T_wc as Isometry3d per frame (for yaw diagnostics)
+static std::vector<Eigen::Isometry3d> load_gt_poses(const std::string& path)
+{
+    std::vector<Eigen::Isometry3d> out;
+    std::ifstream f(path);
+    if (!f.is_open()) return out;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        double v[12];
+        for (int i = 0; i < 12; ++i) ss >> v[i];
+        // row-major 3x4 [R|t]: T_wc (world-from-camera)
+        Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+        T.linear() << v[0], v[1], v[2],
+                       v[4], v[5], v[6],
+                       v[8], v[9], v[10];
+        T.translation() << v[3], v[7], v[11];
+        out.push_back(T);
+    }
+    return out;
+}
+
+// extract yaw (rotation around Y axis) from a world-frame rotation matrix
+// KITTI camera: X=right, Y=down, Z=forward; yaw = rotation about Y
+static double extract_yaw(const Eigen::Matrix3d& R)
+{
+    return std::atan2(R(0, 2), R(0, 0));
+}
+
 // main
 
 int main(int argc, char** argv)
@@ -253,6 +282,15 @@ int main(int argc, char** argv)
     int n_frames  = static_cast<int>(seq.image_paths.size());
     int start_idx = std::max(0, args.start_idx);
     int end_idx   = (args.end_idx < 0) ? n_frames : std::min(args.end_idx, n_frames);
+
+    // ground truth for metrics
+    std::string gt_path_metrics = derive_gt_path(args.sequence_path);
+    auto gt_centers_metrics = load_gt_centers(gt_path_metrics);
+    auto gt_poses = load_gt_poses(gt_path_metrics);
+
+    // per-frame estimated positions (indexed by KITTI frame index)
+    std::vector<std::array<float, 3>> est_centers(n_frames, {0.f, 0.f, 0.f});
+    std::vector<bool> est_valid(n_frames, false);
 
     // main tracking loop
     long frame_count = 0;
@@ -340,6 +378,23 @@ int main(int argc, char** argv)
 
         // per-frame status
         Eigen::Vector3d pos = frame->camera_center();
+        est_centers[i] = {(float)pos.x(), (float)pos.y(), (float)pos.z()};
+        est_valid[i] = true;
+
+        // per-frame yaw diagnostic vs ground truth
+        if (i < (int)gt_poses.size()) {
+            Eigen::Matrix3d R_wc_est = frame->T_wc().rotation();
+            Eigen::Matrix3d R_wc_gt  = gt_poses[i].rotation();
+            double yaw_est = extract_yaw(R_wc_est) * 180.0 / 3.14159265358979323846;
+            double yaw_gt  = extract_yaw(R_wc_gt)  * 180.0 / 3.14159265358979323846;
+            double yaw_err = yaw_est - yaw_gt;
+            // wrap to [-180, 180]
+            while (yaw_err >  180.0) yaw_err -= 360.0;
+            while (yaw_err < -180.0) yaw_err += 360.0;
+            fprintf(stderr, "[DIAG] frame=%d yaw_est=%.2f yaw_gt=%.2f err=%.2f deg\n",
+                    i, yaw_est, yaw_gt, yaw_err);
+        }
+
         fprintf(stderr, "[%05d] track=%.1fms ba=%.1fms tracked=%3d kf=%zu pts=%zu "
                "pos=(%.2f,%.2f,%.2f) %s\n",
                i, track_ms, ba_ms,
@@ -360,6 +415,71 @@ int main(int argc, char** argv)
               << fps << " FPS\n"
               << "  Keyframes : " << map->num_keyframes() << "\n"
               << "  Map points: " << map->num_map_points() << "\n";
+
+    // --- Trajectory evaluation: ATE and RPE ---
+    if (!gt_centers_metrics.empty()) {
+        // ATE: absolute position error (no alignment — stereo SLAM is metric)
+        double ate_sum2 = 0.0;
+        double y_max_dev = 0.0;
+        int ate_count = 0;
+        double y_ref = gt_centers_metrics.empty() ? 0.0 : gt_centers_metrics[0][1];
+
+        for (int i = start_idx; i < end_idx && i < (int)gt_centers_metrics.size(); ++i) {
+            if (!est_valid[i]) continue;
+            double dx = est_centers[i][0] - gt_centers_metrics[i][0];
+            double dy = est_centers[i][1] - gt_centers_metrics[i][1];
+            double dz = est_centers[i][2] - gt_centers_metrics[i][2];
+            ate_sum2 += dx*dx + dy*dy + dz*dz;
+            y_max_dev = std::max(y_max_dev, std::abs((double)est_centers[i][1] - y_ref));
+            ++ate_count;
+        }
+
+        if (ate_count > 0) {
+            double ate_rmse = std::sqrt(ate_sum2 / ate_count);
+            std::cout << "\n[Metrics] ATE RMSE: " << ate_rmse << " m  (over "
+                      << ate_count << " frames)\n";
+            std::cout << "[Metrics] Max Y deviation from start: " << y_max_dev << " m\n";
+        }
+
+        // RPE: relative pose error over 100-frame segments (KITTI convention)
+        const int rpe_delta = 100;
+        double rpe_t_sum2 = 0.0;
+        double rpe_seg_dist_sum = 0.0;
+        int rpe_count = 0;
+
+        for (int i = start_idx; i + rpe_delta < end_idx
+             && i + rpe_delta < (int)gt_centers_metrics.size(); ++i) {
+            if (!est_valid[i] || !est_valid[i + rpe_delta]) continue;
+
+            // GT segment length
+            double gt_dx = gt_centers_metrics[i+rpe_delta][0] - gt_centers_metrics[i][0];
+            double gt_dy = gt_centers_metrics[i+rpe_delta][1] - gt_centers_metrics[i][1];
+            double gt_dz = gt_centers_metrics[i+rpe_delta][2] - gt_centers_metrics[i][2];
+            double gt_len = std::sqrt(gt_dx*gt_dx + gt_dy*gt_dy + gt_dz*gt_dz);
+            if (gt_len < 1.0) continue;  // skip near-stationary segments
+
+            // estimated segment
+            double e_dx = est_centers[i+rpe_delta][0] - est_centers[i][0];
+            double e_dy = est_centers[i+rpe_delta][1] - est_centers[i][1];
+            double e_dz = est_centers[i+rpe_delta][2] - est_centers[i][2];
+
+            // relative translation error
+            double err_dx = e_dx - gt_dx;
+            double err_dy = e_dy - gt_dy;
+            double err_dz = e_dz - gt_dz;
+            double err = std::sqrt(err_dx*err_dx + err_dy*err_dy + err_dz*err_dz);
+            rpe_t_sum2 += (err / gt_len) * (err / gt_len);
+            rpe_seg_dist_sum += gt_len;
+            ++rpe_count;
+        }
+
+        if (rpe_count > 0) {
+            double rpe_t_pct = 100.0 * std::sqrt(rpe_t_sum2 / rpe_count);
+            std::cout << "[Metrics] RPE_t: " << rpe_t_pct << "%  (over "
+                      << rpe_count << " segments of " << rpe_delta << " frames, "
+                      << "avg segment " << rpe_seg_dist_sum / rpe_count << " m)\n";
+        }
+    }
 
     return 0;
 }
