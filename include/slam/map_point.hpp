@@ -11,27 +11,23 @@ namespace slam {
 
 class Frame;
 
-/// a 3D landmark: world-frame position, representative descriptor, and
-/// an observation list mapping frame_id → keypoint index.
+// a 3D landmark: world-frame position, descriptor, & observation list
 class MapPoint {
 public:
     using Ptr = std::shared_ptr<MapPoint>;
 
     static Ptr create(const Eigen::Vector3d& position, long id);
 
-    // identity
     long id;
-    bool is_bad = false;   // flagged for removal
+    bool is_bad = false;  // flagged for removal
 
-    // geometry
-    Eigen::Vector3d position;    // X_w — world-frame 3-D position
-    cv::Mat         descriptor;  // representative 32-byte ORB descriptor
+    Eigen::Vector3d position;    // X_w
+    cv::Mat         descriptor;  // representative 32-byte ORB desc
 
-    // visibility
-    int observed_times  = 0;   // total observation count
-    int visible_times   = 0;   // times visible in a frame (for matching ratio)
+    int observed_times  = 0;  // total observation count
+    int visible_times   = 0;  // times visible in a frame (for match ratio culling)
 
-    // observations: frame_id → keypoint index
+    // observations: frame_id -> kp index
     std::map<long, int> observations;
     mutable std::mutex  obs_mutex;
 
@@ -40,7 +36,7 @@ public:
     int  get_keypoint_idx(long frame_id) const;
     int  num_observations() const;
 
-    /// update the representative descriptor from all current observations
+    // recompute representative desc from all current observations
     void update_descriptor(
         const std::vector<std::shared_ptr<Frame>>& frames);
 

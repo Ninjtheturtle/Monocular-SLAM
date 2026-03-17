@@ -8,7 +8,7 @@ namespace slam {
 
 Camera Camera::from_kitti_calib(const std::string& calib_file)
 {
-    // P0 = left grayscale intrinsics, P1[3] = -fx·b → baseline = -P1[3]/fx
+    // P0 = left gray intrinsics, P1[3] encodes baseline as -fx*b
 
     std::ifstream f(calib_file);
     if (!f.is_open()) {
@@ -24,8 +24,7 @@ Camera Camera::from_kitti_calib(const std::string& calib_file)
             std::istringstream ss(line.substr(3));
             double vals[12];
             for (int i = 0; i < 12; ++i) ss >> vals[i];
-            // P0 = K * [I | 0]: vals = [fx, 0, cx, 0, 0, fy, cy, 0, 0, 0, 1, 0]
-            cam.fx = vals[0];
+            cam.fx = vals[0]; // P0 = K*[I|0]: layout [fx,0,cx,0, 0,fy,cy,0, 0,0,1,0]
             cam.fy = vals[5];
             cam.cx = vals[2];
             cam.cy = vals[6];
@@ -38,9 +37,8 @@ Camera Camera::from_kitti_calib(const std::string& calib_file)
             std::istringstream ss(line.substr(3));
             double vals[12];
             for (int i = 0; i < 12; ++i) ss >> vals[i];
-            // P1[3] = -fx·b  →  b = -P1[3] / fx
             if (cam.fx > 0.0)
-                cam.baseline = -vals[3] / cam.fx;
+                cam.baseline = -vals[3] / cam.fx; // P1[3] = -fx*b -> b = -P1[3]/fx
             got_p1 = true;
         }
         if (got_p0 && got_p1) break;
@@ -49,7 +47,7 @@ Camera Camera::from_kitti_calib(const std::string& calib_file)
     if (!got_p0)
         throw std::runtime_error("P0 not found in calib file: " + calib_file);
 
-    // diagnostic: warn if P2/P3 (color) baseline differs from P0/P1 — wrong choice causes scale error
+    // warn if P2/P3 (color) baseline differs — loading wrong image dirs is a common mistake
     {
         std::ifstream f2(calib_file);
         bool got_p2 = false, got_p3 = false;

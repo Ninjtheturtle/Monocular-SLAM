@@ -6,10 +6,10 @@
 
 namespace slam {
 
-/// pinhole camera model with optional radial distortion.
+// pinhole camera model w/ optional radial distortion
 struct Camera {
-    double fx, fy;  // focal lengths (pixels)
-    double cx, cy;  // principal point (pixels)
+    double fx, fy;  // focal lengths (px)
+    double cx, cy;  // principal point (px)
     double k1, k2;  // radial distortion (0 if undistorted)
     int    width, height;
     double baseline = 0.0;  // stereo baseline in metres (0 = monocular)
@@ -22,7 +22,7 @@ struct Camera {
         : fx(fx), fy(fy), cx(cx), cy(cy),
           k1(k1), k2(k2), width(width), height(height) {}
 
-    /// 3×3 intrinsic matrix K
+    // 3x3 intrinsic matrix K
     Eigen::Matrix3d K() const {
         Eigen::Matrix3d mat;
         mat << fx,  0, cx,
@@ -31,7 +31,7 @@ struct Camera {
         return mat;
     }
 
-    /// OpenCV intrinsic matrix (for solvePnP etc.)
+    // cv::Mat version for solvePnP etc
     cv::Mat K_cv() const {
         cv::Mat mat = (cv::Mat_<double>(3, 3)
             << fx,  0, cx,
@@ -40,23 +40,23 @@ struct Camera {
         return mat;
     }
 
-    /// distortion coefficients [k1, k2, 0, 0] for OpenCV
+    // distortion coeffs [k1, k2, 0, 0] for OpenCV
     cv::Mat dist_cv() const {
         return (cv::Mat_<double>(1, 4) << k1, k2, 0.0, 0.0);
     }
 
-    /// project a 3D point (camera frame) to image plane
+    // project 3D point (camera frame) -> pixel
     Eigen::Vector2d project(const Eigen::Vector3d& Xc) const {
         return {fx * Xc(0) / Xc(2) + cx,
                 fy * Xc(1) / Xc(2) + cy};
     }
 
-    /// back-project a pixel to a unit bearing vector (camera frame)
+    // back-project pixel -> unit bearing vector (camera frame)
     Eigen::Vector3d unproject(double u, double v) const {
         return Eigen::Vector3d((u - cx) / fx, (v - cy) / fy, 1.0).normalized();
     }
 
-    /// parse KITTI calib.txt and return the P0 camera parameters
+    // parse KITTI calib.txt -> P0 camera params
     static Camera from_kitti_calib(const std::string& calib_file);
 };
 
