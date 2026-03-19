@@ -6,7 +6,7 @@
 #include <opencv2/features2d.hpp>
 #include <memory>
 
-// Forward-declare deep components to avoid pulling TRT/torch into every TU
+// fwd-declare deep components to avoid pulling torch/TRT into every TU
 namespace deep {
 class XFeatExtractor;
 class LighterGlueAsync;
@@ -18,32 +18,30 @@ struct RelocResult;
 namespace slam {
 
 enum class TrackingState {
-    NOT_INITIALIZED,  // waiting for sufficient stereo/mono initialization
+    NOT_INITIALIZED,  // waiting for stereo/mono init
     OK,               // normal tracking
-    COASTING,         // tracking failed; dead-reckoning with velocity model
-    LOST,             // coasting limit exceeded; awaiting LighterGlue relocalization
-    RELOCALIZING      // LighterGlue job submitted; waiting for async result
+    COASTING,         // tracking failed; dead-reckoning w/ velocity model
+    LOST,             // coasting limit exceeded; awaiting LG reloc
+    RELOCALIZING      // LG job submitted; polling for async result
 };
 
-/// front-end tracker — hybrid deep-geometric pipeline:
-///   1. extract XFeat keypoints + FP16 descriptors (TensorRT)
-///   2. if not initialized: stereo single-frame init (or monocular two-frame)
-///   3. if OK: predict pose with constant velocity, refine with FP16-L2-matched
-///      map-point reprojections and PnP RANSAC
-///   4. confidence weights from L2 ratio → frame->match_confidence[]
-///   5. coasting up to 8 frames on velocity model before LOST
-///   6. LOST: submit async LighterGlue job for relocalization (non-blocking)
-///   7. RELOCALIZING: poll LighterGlue result each frame; apply on success
-///   8. keyframe insertion: push descriptors to TTT loop detector (non-blocking)
+// front-end tracker — hybrid deep-geometric pipeline:
+//   1. XFeat kps + FP16 descs
+//   2. stereo single-frame init (metric scale from baseline)
+//   3. constant-velocity prediction -> FP16 L2 match -> PnP RANSAC
+//   4. L2 ratio confidence -> match_confidence[]
+//   5. coast up to 8 frames before LOST
+//   6. LOST -> async LG reloc (non-blocking)
+//   7. RELOCALIZING -> poll LG each frame; apply on success
+//   8. KF insertion -> push descs to TTT loop detector
 class Tracker {
 public:
     struct Config {
-        // XFeat / feature extraction
         int   max_keypoints      = 2000;
         float anms_min_response  = 0.005f;
-        float l2_ratio           = 0.8f;   // Lowe ratio for FP16 L2 matching
+        float l2_ratio           = 0.8f;  // Lowe ratio for FP16 L2 matching
 
-        // Legacy ORB fields retained for monocular fallback and init
+        // legacy ORB (non-hybrid mode)
         int   orb_features       = 2000;
         float orb_scale_factor   = 1.2f;
         int   orb_levels         = 8;
@@ -59,18 +57,17 @@ public:
         float stereo_d_min       = 3.0f;
         float stereo_d_max       = 300.0f;
 
-        // Coasting / LOST behavior
-        int   coast_limit        = 8;   // frames before declaring LOST
-        int   reloc_timeout      = 20;  // frames before giving up on LG reloc
+        int   coast_limit        = 8;   // frames before LOST
+        int   reloc_timeout      = 20;  // frames before giving up on LG
     };
 
     using Ptr = std::shared_ptr<Tracker>;
 
-    // Basic factory (no deep components; falls back to ORB pipeline)
+    // basic factory (ORB fallback, no deep components)
     static Ptr create(const Camera& cam, Map::Ptr map,
                       const Config& cfg = Config{});
 
-    // Full hybrid factory — takes ownership of deep component pointers
+    // hybrid factory — takes ownership of deep component ptrs
     static Ptr create_hybrid(
         const Camera& cam, Map::Ptr map,
         std::shared_ptr<deep::XFeatExtractor>  xfeat,
@@ -78,13 +75,10 @@ public:
         std::shared_ptr<deep::TTTLoopDetector>  ttt,
         const Config& cfg = Config{});
 
-    /// process a new frame; returns true if tracking succeeded
-    bool track(Frame::Ptr frame);
-
+    bool track(Frame::Ptr frame);  // returns true if tracking succeeded
     TrackingState state() const { return state_; }
 
-    /// call after BA to invalidate the stale velocity estimate.
-    /// see notify_ba_update() in tracker.cpp for why we don't re-derive velocity_ from BA poses.
+    // call after BA to re-derive velocity from corrected KF poses
     void notify_ba_update();
 
 private:
@@ -94,55 +88,41 @@ private:
     bool need_new_keyframe(Frame::Ptr frame) const;
     void insert_keyframe(Frame::Ptr frame);
 
-    // --- Hybrid-mode feature extraction ---
-    // Runs XFeat TRT inference, populates frame->keypoints, xfeat_descriptors,
-    // match_confidence (initialized to 1.0), and feat_map_{left,right}.
+    // hybrid feature extraction: XFeat inference -> kps, descs, feat_maps
     void extract_features_hybrid(Frame::Ptr frame);
 
-    // Ensures device L2 matching buffers have capacity for N_q × N_t descriptors.
-    void ensure_l2_buffers(int N_q, int N_t);
+    void ensure_l2_buffers(int N_q, int N_t);  // lazy alloc for L2 match buffers
 
-    // Logs keypoint grid occupancy to stderr for spatial distribution diagnosis.
+    // spatial distribution diagnostic — logged at every KF
     void log_anms_grid_stats(const std::vector<cv::KeyPoint>& kps,
                              int img_w, int img_h,
                              int grid_cols, int grid_rows) const;
 
-    // FP16 L2 matching using XFeat descriptors.
-    // Outputs matches with confidence weights in frame->match_confidence.
+    // FP16 L2 matching for XFeat descs
     std::vector<cv::DMatch> match_l2_fp16(
-        const cv::Mat& query_descs_fp32,   // [N_q × 64] CV_32F (from frame)
-        const cv::Mat& train_descs_fp32,   // [N_t × 64] CV_32F (from pool)
-        std::vector<float>& out_confidence // [N_q] pseudo-confidence per query match
+        const cv::Mat& query_descs_fp32,
+        const cv::Mat& train_descs_fp32,
+        std::vector<float>& out_confidence
     );
 
-    // Submit a relocalization job to LighterGlueAsync.
-    // Picks best TTT candidate. Non-blocking; returns false if LG is busy.
+    // submit async LG reloc job; returns false if LG busy
     bool submit_reloc_job(Frame::Ptr frame);
-
-    // Apply a successful RelocResult: build 3D-2D correspondences and run PnP.
     bool apply_reloc_result(Frame::Ptr frame, const deep::RelocResult& result);
 
-    /// GPU Hamming matcher; returns cv::DMatch vector filtered by ratio test
+    // GPU Hamming matcher w/ ratio test
     std::vector<cv::DMatch> match_descriptors(
         const cv::Mat& query_desc,
         const cv::Mat& train_desc,
         bool use_ratio = true
     );
 
-    /// triangulate points between two frames and add them to the map
     int triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
                             const std::vector<cv::DMatch>& matches);
 
-    /// GPU stereo epipolar matching: fills frame->uR with right x-coords
-    void match_stereo(Frame::Ptr frame);
+    void match_stereo(Frame::Ptr frame);  // GPU stereo epipolar -> fills uR
+    int triangulate_stereo(Frame::Ptr frame);  // metric depth from stereo disparity
+    bool try_relocalize(Frame::Ptr frame);  // match against full global map
 
-    /// triangulate metric map points from a single stereo frame (frame->uR must be set)
-    int triangulate_stereo(Frame::Ptr frame);
-
-    /// attempt to recover pose against the full global map when LOST
-    bool try_relocalize(Frame::Ptr frame);
-
-    /// median angular parallax (radians) of tracked map points between frame and ref_kf
     double compute_median_parallax(Frame::Ptr frame, Frame::Ptr ref_kf) const;
 
     Camera         cam_;
@@ -150,42 +130,38 @@ private:
     Config         cfg_;
     TrackingState  state_ = TrackingState::NOT_INITIALIZED;
 
-    // --- Legacy ORB frontend (monocular fallback / non-hybrid mode) ---
-    cv::Ptr<cv::ORB> orb_;
+    cv::Ptr<cv::ORB> orb_;  // legacy ORB (also fallback in hybrid mode)
 
-    // --- Deep frontend components (hybrid mode; null in non-hybrid) ---
+    // deep frontend (null in non-hybrid mode)
     std::shared_ptr<deep::XFeatExtractor>   xfeat_;
     std::shared_ptr<deep::LighterGlueAsync> lighter_glue_;
     std::shared_ptr<deep::TTTLoopDetector>  ttt_;
     bool hybrid_mode_ = false;
 
-    // L2 matching device buffers (allocated lazily on first use)
-    // Only non-null in hybrid mode.
+    // L2 match device buffers (lazy alloc, hybrid mode only)
     __half* d_query_descs_ = nullptr;
     __half* d_train_descs_ = nullptr;
     int*    d_best_idx_    = nullptr;
     float*  d_best_dist_   = nullptr;
     float*  d_pseudo_conf_ = nullptr;
-    // Coordinate buffers for the stereo epipolar kernel
-    float*  d_y_q_         = nullptr;
+    float*  d_y_q_         = nullptr;  // stereo epipolar coord buffers
     float*  d_y_t_         = nullptr;
     float*  d_x_q_         = nullptr;
     float*  d_x_t_         = nullptr;
-    int     d_buf_capacity_ = 0;  // number of descriptors each buffer can hold
+    int     d_buf_capacity_ = 0;
 
     Frame::Ptr last_frame_;
     Frame::Ptr last_keyframe_;
 
-    // PnP inlier count at the last KF insertion (pre-triangulation)
-    int last_kf_pnp_tracked_ = 0;
+    int last_kf_pnp_tracked_ = 0;  // PnP inlier count at last KF (pre-triangulation)
 
-    // constant velocity motion model
+    // SE(3) constant velocity model w/ exponential decay
     Eigen::Isometry3d velocity_ = Eigen::Isometry3d::Identity();
     bool velocity_valid_ = false;
+    void recompute_velocity_from_ba();
 
-    // coasting / lost
     int lost_streak_     = 0;
-    int reloc_wait_frames_ = 0;  // frames elapsed since LG job was submitted
+    int reloc_wait_frames_ = 0;  // frames since LG job was submitted
 };
 
 }  // namespace slam
