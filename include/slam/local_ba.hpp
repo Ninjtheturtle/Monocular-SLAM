@@ -2,28 +2,73 @@
 
 #include "slam/camera.hpp"
 #include "slam/map.hpp"
+
+#include <ceres/ceres.h>
+#include <Eigen/Geometry>
+#include <Eigen/Dense>
+
 #include <memory>
-#include <cmath>  // std::sqrt
+#include <cmath>
+#include <vector>
+#include <array>
+#include <unordered_map>
 
 namespace slam {
 
-/// Sliding-window local bundle adjustment using Ceres Solver.
-///
-/// Optimizes the poses of the N most recent keyframes and all map points
-/// visible in those keyframes.  The oldest keyframe's pose is held fixed
-/// to remove gauge freedom (no absolute reference in monocular SLAM).
-///
-/// Cost function: reprojection error with Huber loss (δ = 1.0 pixel).
-/// Parameterization: 6-DOF pose = [angle-axis ω (3D) | translation t (3D)]
-///
-/// Analytical Jacobians are provided for efficiency (avoids auto-diff overhead
-/// on the reprojection cost, which is a tight inner loop in BA).
+// --- marginalization prior ---
+// dense quadratic prior from Schur complement marginalization of oldest KF
+// E_prior = 0.5 * ||S*delta + e0||^2
+// delta = stacked tangent-space deviation from linearization pts
+// S^T S = H* (marginalized Hessian), e0 = S^{-T} b* (gradient offset, ~0 at optimum)
+// FEJ (first-estimate Jacobians) used for consistency
+
+struct MarginalizationInfo {
+    bool valid = false;
+
+    Eigen::MatrixXd S;   // total_dim x total_dim; H* = S^T S
+    Eigen::VectorXd e0;  // total_dim; residual offset
+
+    struct PoseBlock {
+        long frame_id;
+        int  offset;  // offset in stacked tangent vec (6-aligned)
+        std::array<double, 7> x0;  // ambient linearization pt [qx,qy,qz,qw,tx,ty,tz]
+    };
+    std::vector<PoseBlock> poses;
+    int total_dim = 0;  // = poses.size() * 6
+};
+
+// dynamic-sized cost function injecting the marg prior
+// one 7-DOF pose param block per kept pose; residual dim = total_dim
+// r = S * delta + e0; J = FEJ ambient: S_i * J_pinv(x0_i)
+class MarginalizationPriorCost : public ceres::CostFunction {
+public:
+    explicit MarginalizationPriorCost(const MarginalizationInfo& info);
+
+    bool Evaluate(double const* const* parameters,
+                  double* residuals,
+                  double** jacobians) const override;
+
+private:
+    MarginalizationInfo info_;
+    std::vector<Eigen::Matrix<double, Eigen::Dynamic, 7>> J_amb_;  // precomputed FEJ per block
+};
+
+// --- LocalBA ---
+// sliding-window BA w/ Ceres
+// optimizes last N KF poses + all visible map pts
+// when window is full, oldest KF is marginalized via Schur complement
+// cost: stereo/mono reproj w/ Huber + marg prior
+// parameterization: 7-DOF [qx,qy,qz,qw,tx,ty,tz] w/ EigenQuaternionManifold
+// analytical Jacobians for reproj; FEJ for prior
+
 class LocalBA {
 public:
     struct Config {
-        int   max_iterations     = 60;
-        int   window_size        = Map::kWindowSize;
-        double huber_delta       = 1.0;   // pixels
+        int    max_iterations    = 60;
+        int    window_size       = Map::kWindowSize;
+        double huber_delta       = 1.5;   // Huber kernel threshold (px)
+        double sigma_px          = 1.0;   // pixel noise sigma
+        double z_ref             = 15.0;  // depth ref for info attenuation (m)
         bool   verbose           = false;
     };
 
@@ -31,132 +76,82 @@ public:
     static Ptr create(const Camera& cam, Map::Ptr map,
                       const Config& cfg = Config{});
 
-    /// Run one BA iteration on the current sliding window.
-    /// Called after inserting a new keyframe.
-    void optimize();
+    void optimize();  // run one BA iteration on current window
 
 private:
     Camera   cam_;
     Map::Ptr map_;
     Config   cfg_;
 
+    MarginalizationInfo marg_info_;  // prior from previously dropped KF
+
+    // build marg prior after optimization; eliminates oldest KF from reduced Hessian
+    void compute_marginalization_prior(
+        const std::vector<Frame::Ptr>& window,
+        const std::unordered_map<long, std::vector<double>>& pose_params,
+        const std::unordered_map<long, std::array<double, 3>>& point_params);
+
     LocalBA() = default;
 };
 
-// ─── Analytical Jacobian Cost Function ───────────────────────────────────────
+// --- analytical cost functions (quaternion parameterized) ---
+// pose block: 7 doubles [qx,qy,qz,qw,tx,ty,tz] — Eigen storage (x,y,z,w)
+// point block: 3 doubles [X,Y,Z] (world frame)
+// hand-derived Jacobians from explicit R(q) formula
+// dR/dq_i computed treating all 4 quat components as independent (ambient derivative)
+// Ceres EigenQuaternionManifold projects onto 3-DOF tangent plane
 //
-// See local_ba.cpp for the implementation.
-// Declared here so unit tests can instantiate it directly.
+// stereo info weighting:
+//   Omega_uv = 1/sigma^2 (bearing — constant)
+//   Omega_d  = Omega_uv * min(1, Z_ref^2/Z^2) (disparity — attenuated at depth)
+//   residuals premultiplied by sqrt(Omega_i) -> Ceres minimizes sum(r_i^2) = Mahalanobis
 
-struct ReprojectionCost {
-    // Observation: image coordinates and camera intrinsics
-    double u_obs, v_obs;
-    double fx, fy, cx, cy;
+// stereo: 3 residuals (u_L, v_L, u_R)
+class StereoReprojCost final : public ceres::SizedCostFunction<3, 7, 3> {
+public:
+    StereoReprojCost(double obs_uL, double obs_vL, double obs_uR,
+                     double fx, double fy, double cx, double cy,
+                     double b, double info_uv, double info_disp);
 
-    ReprojectionCost(double u, double v, double fx, double fy,
-                     double cx, double cy)
-        : u_obs(u), v_obs(v), fx(fx), fy(fy), cx(cx), cy(cy) {}
+    bool Evaluate(double const* const* parameters,
+                  double* residuals,
+                  double** jacobians) const override;
 
-    // Ceres analytic cost function signature:
-    // pose[6]  = [omega_x, omega_y, omega_z, tx, ty, tz]
-    // point[3] = [X, Y, Z] world frame
-    // residuals[2] = [u - u_obs, v - v_obs]
-    bool operator()(const double* const pose,
-                    const double* const point,
-                    double* residuals,
-                    double** jacobians) const;
+    static ceres::CostFunction* Create(double obs_uL, double obs_vL, double obs_uR,
+                                        double fx, double fy, double cx, double cy,
+                                        double b, double info_uv, double info_disp) {
+        return new StereoReprojCost(obs_uL, obs_vL, obs_uR, fx, fy, cx, cy, b,
+                                    info_uv, info_disp);
+    }
 
-    static constexpr int kNumResiduals    = 2;
-    static constexpr int kNumPoseParams   = 6;
-    static constexpr int kNumPointParams  = 3;
+private:
+    double obs_uL_, obs_vL_, obs_uR_;
+    double fx_, fy_, cx_, cy_, b_;
+    double sqrt_info_uv_;  // sqrt(Omega) for bearing (rows 0,1)
+    double sqrt_info_d_;   // sqrt(Omega) for disparity (row 2)
 };
 
-// ─── Stereo Analytical Jacobian Cost Function ─────────────────────────────────
-//
-// Adds a third residual for the right camera reprojection:
-//   u_R = fx * (X_c - baseline) / Z_c + cx
-//
-// residuals[2] = u_R_proj - u_R_obs
-//
-// The right camera shares the same intrinsics K and is translated by
-// [-baseline, 0, 0] in the left camera frame (rectified stereo).
+// mono: 2 residuals (u, v) — used when uR < 0 (no stereo match)
+class MonoReprojCost final : public ceres::SizedCostFunction<2, 7, 3> {
+public:
+    MonoReprojCost(double obs_u, double obs_v,
+                   double fx, double fy, double cx, double cy,
+                   double info_uv);
 
-struct StereoReprojectionCost {
-    double u_L_obs, v_L_obs, u_R_obs;
-    double fx, fy, cx, cy, baseline;
+    bool Evaluate(double const* const* parameters,
+                  double* residuals,
+                  double** jacobians) const override;
 
-    StereoReprojectionCost(double uL, double vL, double uR,
-                           double fx_, double fy_, double cx_, double cy_,
-                           double b)
-        : u_L_obs(uL), v_L_obs(vL), u_R_obs(uR),
-          fx(fx_), fy(fy_), cx(cx_), cy(cy_), baseline(b) {}
+    static ceres::CostFunction* Create(double obs_u, double obs_v,
+                                        double fx, double fy, double cx, double cy,
+                                        double info_uv) {
+        return new MonoReprojCost(obs_u, obs_v, fx, fy, cx, cy, info_uv);
+    }
 
-    // residuals[3] = [u_L - u_L_obs, v_L - v_L_obs, u_R - u_R_obs]
-    bool operator()(const double* const pose,
-                    const double* const point,
-                    double* residuals,
-                    double** jacobians) const;
-
-    static constexpr int kNumResiduals   = 3;
-    static constexpr int kNumPoseParams  = 6;
-    static constexpr int kNumPointParams = 3;
-};
-
-// ─── Confidence-Weighted variants ─────────────────────────────────────────────
-//
-// Scales residuals (and Jacobians) by sqrt(weight), which is mathematically
-// equivalent to multiplying the information matrix Σ⁻¹ by weight.
-//
-// weight = frame->match_confidence[kp_idx], sourced from:
-//   • Temporal tracking: L2 ratio pseudo-confidence ∈ [0.1, 1.0]
-//   • LighterGlue relocalization: raw output probability ∈ [0, 1]
-//
-// When weight == 1.0 these reduce to the original ReprojectionCost /
-// StereoReprojectionCost, preserving backward compatibility.
-
-struct ConfidenceWeightedReprojectionCost {
-    double u_obs, v_obs;
-    double fx, fy, cx, cy;
-    double sqrt_w;  // = sqrt(match_confidence)
-
-    ConfidenceWeightedReprojectionCost(double u, double v,
-                                       double fx_, double fy_,
-                                       double cx_, double cy_,
-                                       double weight)
-        : u_obs(u), v_obs(v), fx(fx_), fy(fy_), cx(cx_), cy(cy_),
-          sqrt_w(std::sqrt(std::max(weight, 0.01))) {}
-
-    bool operator()(const double* const pose,
-                    const double* const point,
-                    double* residuals,
-                    double** jacobians) const;
-
-    static constexpr int kNumResiduals   = 2;
-    static constexpr int kNumPoseParams  = 6;
-    static constexpr int kNumPointParams = 3;
-};
-
-struct ConfidenceWeightedStereoCost {
-    double u_L_obs, v_L_obs, u_R_obs;
-    double fx, fy, cx, cy, baseline;
-    double sqrt_w;
-
-    ConfidenceWeightedStereoCost(double uL, double vL, double uR,
-                                 double fx_, double fy_,
-                                 double cx_, double cy_,
-                                 double b, double weight)
-        : u_L_obs(uL), v_L_obs(vL), u_R_obs(uR),
-          fx(fx_), fy(fy_), cx(cx_), cy(cy_), baseline(b),
-          sqrt_w(std::sqrt(std::max(weight, 0.01))) {}
-
-    bool operator()(const double* const pose,
-                    const double* const point,
-                    double* residuals,
-                    double** jacobians) const;
-
-    static constexpr int kNumResiduals   = 3;
-    static constexpr int kNumPoseParams  = 6;
-    static constexpr int kNumPointParams = 3;
+private:
+    double obs_u_, obs_v_;
+    double fx_, fy_, cx_, cy_;
+    double sqrt_info_uv_;
 };
 
 }  // namespace slam
