@@ -3,8 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 
-// CUDA error-checking macro — aborts with file/line on failure
-
+// abort w/ file:line on CUDA failure
 #define CUDA_CHECK(expr)                                                        \
     do {                                                                        \
         cudaError_t _err = (expr);                                              \
@@ -15,17 +14,16 @@
         }                                                                       \
     } while (0)
 
-// ORB descriptors are 256-bit = 32 bytes = 8 × uint32_t
-
+// ORB descriptors: 256 bits = 32 bytes = 8 x uint32
 static constexpr int kDescBytes  = 32;
-static constexpr int kDescUint32 = 8;   // 32 bytes / 4 bytes per uint32_t
-static constexpr int kMaxHamming = 256; // maximum possible Hamming distance
+static constexpr int kDescUint32 = 8;
+static constexpr int kMaxHamming = 256;
 
-// GPU nearest-neighbour matcher for ORB descriptors (Hamming distance).
-// all pointers are host pointers — device allocation is internal.
+// GPU NN matcher for ORB (Hamming distance)
+// all ptrs are host — device alloc is internal
 
-/// GPU Hamming NN matcher. writes best match index + distance per query.
-/// h_query/h_train: N×32 byte row-major descriptor arrays (host pointers)
+// writes best match idx + distance per query
+// h_query/h_train: Nx32 byte row-major descriptor arrays
 void cuda_match_hamming(
     const uint8_t* h_query,
     const uint8_t* h_train,
@@ -35,8 +33,7 @@ void cuda_match_hamming(
     int*           h_best_dist
 );
 
-/// same as cuda_match_hamming but applies Lowe ratio test.
-/// retains match i only when best_dist[i] / second_dist[i] < ratio.
+// same but w/ Lowe ratio test — retains only if best/second < ratio
 void cuda_match_hamming_ratio(
     const uint8_t* h_query,
     const uint8_t* h_train,
@@ -47,9 +44,9 @@ void cuda_match_hamming_ratio(
     int*           h_best_dist
 );
 
-/// stereo epipolar matcher: restricts candidates to those satisfying
-///   |y_q - y_t| <= epi_tol   and   d_min <= x_q - x_t <= d_max
-/// then applies Lowe ratio test. writes best right index per left descriptor.
+// stereo epipolar matcher: restricts candidates by
+//   |y_q - y_t| <= epi_tol  and  d_min <= x_q - x_t <= d_max
+// then Lowe ratio test; writes best right idx per left desc
 void cuda_match_stereo_epipolar(
     const uint8_t* h_query,
     const uint8_t* h_train,

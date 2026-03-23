@@ -1,40 +1,23 @@
 #pragma once
-// l2_matcher.cuh — FP16 L2-distance nearest-neighbour matching with Lowe ratio test.
+// FP16 L2-distance NN matching w/ Lowe ratio test
 //
-// Kernel design:
-//   Grid  : (N_q, 1, 1) — one block per query descriptor
-//   Block : 256 threads
-//   Each thread strides over the train set, maintaining local best/second-best L2².
-//   Warp-level reduction via __shfl_down_sync() propagates the minimum to lane 0.
-//   half2 vectorization halves the memory-bandwidth pressure for 64-dim FP16 descriptors.
+// grid: (N_q, 1, 1) — one block per query
+// block: 256 threads, stride over train set w/ thread-local best/second L2^2
+// warp reduction via __shfl_down_sync, then cross-warp via shared mem
+// half2 vectorization halves bandwidth for 64-dim FP16 descs
 //
-// Pseudo-confidence output:
-//   w = clamp(1.0f - best_dist / (ratio * second_dist), 0.1f, 1.0f)
-//   Used as confidence weight in ConfidenceWeightedReprojectionCost when LighterGlue
-//   is not active (temporal tracking phase).
+// pseudo-confidence output:
+//   w = clamp(1 - best/ratio*second, 0.1, 1.0)
+//   not currently used by BA but available for future per-obs weighting
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-// ---------------------------------------------------------------------------
-// cuda_match_l2_fp16
-//
-// Inputs (device pointers):
-//   d_query   — [N_q × D] FP16, row-major
-//   d_train   — [N_t × D] FP16, row-major
-//   N_q, N_t  — descriptor counts
-//   D         — descriptor dimension (must be even for half2; typically 64)
-//   ratio     — Lowe ratio threshold (e.g. 0.9f)
-//   stream    — CUDA stream for async dispatch (default: stream 0)
-//
-// Outputs (device pointers, pre-allocated by caller):
-//   d_best_idx    — [N_q] int:   best train index per query (-1 if ratio test failed)
-//   d_best_dist   — [N_q] float: best L2 distance (before rejection)
-//   d_pseudo_conf — [N_q] float: pseudo-confidence weight ∈ [0.1, 1.0]
-//
-// All outputs are written asynchronously on `stream`.
-// Call cudaStreamSynchronize(stream) or cudaDeviceSynchronize() before reading.
-// ---------------------------------------------------------------------------
+// d_query/d_train: device ptrs, [N x D] FP16 row-major
+// D must be even (half2); typically 64
+// d_best_idx: -1 if ratio test failed
+// d_pseudo_conf: [0.1, 1.0] confidence
+// all outputs written async on `stream`
 void cuda_match_l2_fp16(
     const __half* d_query,
     const __half* d_train,
@@ -46,9 +29,8 @@ void cuda_match_l2_fp16(
     cudaStream_t stream = 0
 );
 
-// Stereo variant: enforces |y_q-y_t| <= epi_tol and d_min <= (x_q-x_t) <= d_max
-// inside the GPU kernel before computing L2, so only epipolar-compliant right-frame
-// descriptors compete. Mirrors cuda_match_stereo_epipolar() for the FP16 L2 path.
+// stereo variant: gates on |y_q-y_t| <= epi_tol & d_min <= (x_q-x_t) <= d_max
+// before computing L2 — only epipolar-compliant right descs compete
 void cuda_match_l2_stereo_epipolar(
     const __half* d_query,
     const __half* d_train,
