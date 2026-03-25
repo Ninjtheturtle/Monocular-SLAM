@@ -1,4 +1,4 @@
-// Rerun.io logging for SLAM state. 3D entities live under "world/", not "world/camera/".
+// rerun logging — 3D entities must live under "world/", NOT "world/camera/" or rerun creates a 2D view
 
 #include "slam/visualizer.hpp"
 #include "deep/semi_dense_disparity.hpp"  // deep::SemiDensePoint3D
@@ -23,7 +23,7 @@
 
 namespace slam {
 
-// factory
+// --- init ---
 
 Visualizer::Ptr Visualizer::create(const Config& cfg)
 {
@@ -40,7 +40,7 @@ Visualizer::Ptr Visualizer::create(const Config& cfg)
         std::cout << "[Visualizer] Connected to Rerun at " << cfg.addr << "\n";
     }
 
-    // reset viewport so cached blueprints don't block the 3D view
+    // workaround: reset viewport blueprint so stale cached layouts don't break the 3D view
     {
         rerun::RecordingStream bp(cfg.app_id, "", rerun::StoreKind::Blueprint);
         bp.connect_tcp(cfg.addr);
@@ -51,10 +51,9 @@ Visualizer::Ptr Visualizer::create(const Config& cfg)
                 .with_past_viewer_recommendations({}));
     }
 
-    // RDF = KITTI camera convention; must be on "world" so Rerun creates a 3D view
-    v->rec_->log_static("world", rerun::archetypes::ViewCoordinates::RDF);
+    v->rec_->log_static("world", rerun::archetypes::ViewCoordinates::RDF); // KITTI cam convention
 
-    // tiny anchor point so Rerun auto-creates the 3D view at startup before any data arrives
+    // tiny anchor so rerun creates the 3D view before any real data arrives
     v->rec_->log_static("world/origin",
         rerun::archetypes::Points3D({{0.0f, 0.0f, 0.0f}})
             .with_radii(std::vector<float>{0.001f}));
@@ -64,14 +63,11 @@ Visualizer::Ptr Visualizer::create(const Config& cfg)
 
 Visualizer::~Visualizer() = default;
 
-// log_pinhole
-
 void Visualizer::log_pinhole(const Camera& cam)
 {
     if (!rec_) return;
-    cam_ = cam;  // store for depth projection in log_frame()
+    cam_ = cam;  // stash for later use in log_frame
 
-    // pinhole intrinsics — renders the camera frustum and 2D image panel
     rec_->log_static("world/camera/image",
         rerun::archetypes::Pinhole::from_focal_length_and_resolution(
             {(float)cam.fx, (float)cam.fy},
@@ -79,24 +75,20 @@ void Visualizer::log_pinhole(const Camera& cam)
         )
     );
 
-    // identity anchor so the frustum shows before tracking starts
+    // identity T so the frustum shows before tracking starts
     rec_->log_static("world/camera/image",
         rerun::archetypes::Transform3D::from_translation_rotation(
             {0.0f, 0.0f, 0.0f},
             rerun::datatypes::Quaternion::from_wxyz(1.0f, 0.0f, 0.0f, 0.0f)));
 }
 
-// log_frame
-
 void Visualizer::log_frame(const Frame::Ptr& frame)
 {
     if (!rec_) return;
 
-    // advance timeline so the viewer can scrub through the sequence
-    rec_->set_time_seconds("time", frame->timestamp);
+    rec_->set_time_seconds("time", frame->timestamp); // enables scrubbing in viewer
 
-    // camera pose in world space — moves the 3D frustum each frame
-    if (frame->num_tracked() > 0) {
+    if (frame->num_tracked() > 0) { // move the camera frustum in 3D
         Eigen::Isometry3d  T_wc = frame->T_wc();
         Eigen::Quaterniond q(T_wc.rotation());
         Eigen::Vector3d    t = T_wc.translation();
@@ -107,7 +99,6 @@ void Visualizer::log_frame(const Frame::Ptr& frame)
                     (float)q.w(), (float)q.x(), (float)q.y(), (float)q.z())));
     }
 
-    // camera image → 2D panel (static Pinhole set in log_pinhole() stays on this entity)
     if (cfg_.log_image && !frame->image_gray.empty()) {
         cv::Mat rgb;
         cv::cvtColor(frame->image_gray, rgb, cv::COLOR_GRAY2RGB);
@@ -117,7 +108,6 @@ void Visualizer::log_frame(const Frame::Ptr& frame)
                 std::move(bytes), {(uint32_t)rgb.cols, (uint32_t)rgb.rows}));
     }
 
-    // purple keypoints overlaid on the 2D panel
     if (cfg_.log_keypoints && !frame->keypoints.empty()) {
         std::vector<rerun::datatypes::Vec2D> pts;
         pts.reserve(frame->keypoints.size());
@@ -131,8 +121,8 @@ void Visualizer::log_frame(const Frame::Ptr& frame)
 
 }
 
-// rebuilds trajectory every call so BA corrections show up automatically.
-// KFs more than 50 m apart split into a new strip.
+// rebuilds the full trajectory each frame so BA corrections show immediately
+// gap > 50m -> new strip segment (handles reinit / LOST jumps)
 
 void Visualizer::log_trajectory(const Map::Ptr& map,
                                  const Frame::Ptr& current_frame,
@@ -141,11 +131,10 @@ void Visualizer::log_trajectory(const Map::Ptr& map,
     if (!rec_) return;
     rec_->set_time_seconds("time", ts);
 
-    // archived KFs survive map_->reset(); active KFs are the current segment
-    auto archived = map->trajectory_archive();   // KFs from all prior map segments
-    auto kfs      = map->all_keyframes();         // current active KFs
+    auto archived = map->trajectory_archive();   // kfs from prior map segments — survives reset
+    auto kfs      = map->all_keyframes();
 
-    constexpr double kGapSq = 50.0 * 50.0;  // 50 m gap → new strip segment
+    constexpr double kGapSq = 50.0 * 50.0;  // 50m gap threshold — magic but works for KITTI
 
     std::vector<std::vector<rerun::datatypes::Vec3D>> segments;
     Eigen::Vector3d last_c;
@@ -164,7 +153,7 @@ void Visualizer::log_trajectory(const Map::Ptr& map,
     for (auto& kf : archived) add_kf_pos(kf);
     for (auto& kf : kfs)      add_kf_pos(kf);
 
-    // append live frame if tracked but not yet a KF — avoids duplicating the just-inserted KF
+    // append live frame if not yet promoted to KF — avoids duplicate when KF was just inserted
     if (current_frame && current_frame->num_tracked() > 0 && !current_frame->is_keyframe) {
         Eigen::Vector3d c = current_frame->camera_center();
         if (!has_last || (c - last_c).squaredNorm() > kGapSq) {
@@ -186,8 +175,6 @@ void Visualizer::log_trajectory(const Map::Ptr& map,
             .with_colors({rerun::components::Color(0, 255, 128)})   // bright green
             .with_radii(std::vector<float>(strips.size(), 0.5f)));
 }
-
-// log_map
 
 void Visualizer::log_map(const Map::Ptr& map, double timestamp)
 {
@@ -211,8 +198,6 @@ void Visualizer::log_map(const Map::Ptr& map, double timestamp)
     );
 }
 
-// log_ground_truth
-
 void Visualizer::log_ground_truth(const std::vector<std::array<float, 3>>& centers)
 {
     if (!rec_ || centers.size() < 2) return;
@@ -229,9 +214,8 @@ void Visualizer::log_ground_truth(const std::vector<std::array<float, 3>>& cente
             .with_radii({0.5f}));
 }
 
-// log_semi_dense — visualization-only semi-dense point cloud
-// Entity: world/map/semi_dense  (light blue)
-// ISOLATION: nothing from this function enters the Map or Ceres problem.
+// viz-only semi-dense cloud — entity: world/map/semi_dense
+// ISOLATION: nothing here touches Map or the Ceres problem
 
 void Visualizer::log_semi_dense(
     const std::vector<deep::SemiDensePoint3D>& pts, double ts)

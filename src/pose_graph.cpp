@@ -1,4 +1,4 @@
-// pose graph optimization over co-visibility loop edges.
+// PGO over co-visibility edges — catches drift that BA window misses
 
 #include "slam/pose_graph.hpp"
 
@@ -7,13 +7,12 @@
 
 #include <Eigen/Core>
 #include <opencv2/calib3d.hpp>
-#include <opencv2/features2d.hpp>
 #include <iostream>
 #include <unordered_set>
 
 namespace slam {
 
-// relative pose cost (auto-diff, 6 residuals)
+// 6-residual relative pose cost (autodiff)
 
 struct RelPoseCost {
     double R_meas[9];  // row-major rotation of T_AB_meas
@@ -24,7 +23,6 @@ struct RelPoseCost {
     template <typename T>
     bool operator()(const T* const pa, const T* const pb, T* res) const
     {
-        // rotation matrices from angle-axis vectors
         T Ra[9], Rb[9];
         ceres::AngleAxisToRotationMatrix(pa, Ra);
         ceres::AngleAxisToRotationMatrix(pb, Rb);
@@ -32,7 +30,6 @@ struct RelPoseCost {
         const T* ta = pa + 3;
         const T* tb = pb + 3;
 
-        // cast measurement (double → T)
         T Rm[9], tm[3];
         for (int i = 0; i < 9; ++i) Rm[i] = T(R_meas[i]);
         for (int i = 0; i < 3; ++i) tm[i] = T(t_meas[i]);
@@ -49,7 +46,7 @@ struct RelPoseCost {
             }
         }
 
-        // R_delta = Rm * R_ba,   t_delta = Rm * t_ba + tm
+        // R_delta = Rm * R_ba
         T R_delta[9], t_delta[3];
         for (int r = 0; r < 3; ++r) {
             t_delta[r] = tm[r];
@@ -61,7 +58,6 @@ struct RelPoseCost {
             }
         }
 
-        // Angle-axis of R_delta
         T omega[3];
         ceres::RotationMatrixToAngleAxis(R_delta, omega);
 
@@ -86,7 +82,7 @@ struct RelPoseCost {
     }
 };
 
-// pose helpers
+// angle-axis 6-DOF helpers — note: local_ba uses quaternion 7-DOF, these are different
 
 static void isometry_to_pose(const Eigen::Isometry3d& T, double* pose)
 {
@@ -109,8 +105,6 @@ static Eigen::Isometry3d pose_to_isometry(const double* pose)
     return T;
 }
 
-// PoseGraph implementation
-
 PoseGraph::Ptr PoseGraph::create(Map::Ptr map, const Camera& cam, const Config& cfg)
 {
     auto pg = std::shared_ptr<PoseGraph>(new PoseGraph());
@@ -132,22 +126,21 @@ void PoseGraph::detect_and_add_loops()
 
     Frame::Ptr query = kf_order_.back();
 
-    // collect IDs of KFs inside the local BA window (skip them for loop search)
+    // skip kfs that are still inside the BA window — they're already well-constrained
     std::unordered_set<long> window_ids;
     for (auto& kf : map_->local_window())
         window_ids.insert(kf->id);
 
     for (auto& kf : map_->all_keyframes()) {
         if (kf->id == query->id) continue;
-        if (window_ids.count(kf->id))  continue;  // inside BA window — skip
+        if (window_ids.count(kf->id))  continue;
 
         int shared = map_->count_shared_map_points(kf->id, query->id);
         if (shared < cfg_.min_shared_points) continue;
 
-        // compute relative pose T_AB = T_A_cw * T_B_cw.inverse()
+        // relative pose from current map estimates — not ground truth, but good enough for PGO
         Eigen::Isometry3d T_AB = kf->T_cw * query->T_cw.inverse();
 
-        // extract R (row-major) and t
         Edge e;
         e.id_a = kf->id;
         e.id_b = query->id;
@@ -173,7 +166,6 @@ void PoseGraph::optimize()
     auto all_kfs = map_->all_keyframes();
     if (all_kfs.size() < 2 || edges_.empty()) return;
 
-    // allocate pose parameter blocks (one 6-vector per KF)
     std::unordered_map<long, std::vector<double>> pose_params;
     for (auto& kf : all_kfs) {
         pose_params[kf->id].resize(6);
@@ -182,7 +174,6 @@ void PoseGraph::optimize()
 
     ceres::Problem problem;
 
-    // add relative-pose edges
     for (auto& e : edges_) {
         auto it_a = pose_params.find(e.id_a);
         auto it_b = pose_params.find(e.id_b);
@@ -197,10 +188,9 @@ void PoseGraph::optimize()
 
     if (problem.NumResidualBlocks() == 0) return;
 
-    // register all parameter blocks and fix oldest KF as gauge anchor
     for (auto& kf : all_kfs)
         problem.AddParameterBlock(pose_params[kf->id].data(), 6);
-    problem.SetParameterBlockConstant(pose_params[all_kfs.front()->id].data());
+    problem.SetParameterBlockConstant(pose_params[all_kfs.front()->id].data()); // fix oldest for gauge freedom
 
     ceres::Solver::Options options;
     options.linear_solver_type        = ceres::SPARSE_NORMAL_CHOLESKY;
@@ -211,7 +201,6 @@ void PoseGraph::optimize()
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    // write back optimized poses
     for (auto& kf : all_kfs) {
         auto it = pose_params.find(kf->id);
         if (it != pose_params.end())
@@ -222,13 +211,7 @@ void PoseGraph::optimize()
               << " KFs with " << edges_.size() << " edges  ("
               << summary.BriefReport() << ")\n";
 
-    new_loops_ = false;  // reset until next detection round
-}
-
-// appearance-based loop detection (disabled — needs a visual vocabulary like DBoW)
-
-void PoseGraph::detect_and_add_loops_visual(Frame::Ptr /*query*/)
-{
+    new_loops_ = false;
 }
 
 }  // namespace slam
