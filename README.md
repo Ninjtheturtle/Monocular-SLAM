@@ -1,219 +1,150 @@
-﻿# Stereo Visual SLAM
+# Stereo Visual SLAM — from scratch
 
-A ground-up stereo Visual SLAM engine in C++17 and CUDA targeting real-time performance on the KITTI odometry benchmark. Implements the full loop: GPU-accelerated ORB feature matching, metric stereo initialization, constant-velocity tracking with PnP-RANSAC, sliding-window bundle adjustment, pose-graph optimization, and real-time 3D visualization.
+<!-- VIDEO: drag-and-drop the mp4 into a GitHub issue comment to get a user-attachments URL, then paste it here -->
 
-![SLAM trajectory vs ground truth on KITTI sequence 00](docs/trajectory.png)
-
-*Green: SLAM estimate. Orange: KITTI ground truth. White: active map point cloud.*
+> KITTI sequence 00 — green is my estimate, orange is ground truth, white dots are the live map point cloud
 
 ---
 
-## Features
+## why i built this
 
-- Single-frame stereo triangulation for absolute metric depth (no scale drift)
-- Custom CUDA Hamming kernel with warp-shuffle reduction; handles epipolar constraints and ratio test on-device
-- Two-phase tracking: projection-based spatial search with GPU Hamming fallback; search radius adapts to predicted rotation
-- Ceres SPARSE_SCHUR bundle adjustment with analytical Jacobians, 30-KF sliding window, turn-adaptive Huber loss
-- Pose-graph optimization over co-visibility edges, runs every 5 keyframes
-- 8-frame coasting, global relocalization (>=30 PnP inliers), map reset with pose propagation on LOST
-- Map resets archive keyframes into a persistent trajectory history so the visualization never loses its path
-- Real-time 3D visualization via [Rerun 0.22.1](https://rerun.io/)
+i wanted to understand how SLAM actually works — not from a textbook, not from wrapping someone else's library, but by writing every piece myself. the tracker, the bundle adjustment, the GPU kernels, the map, the state machine, all of it. this is a stereo visual SLAM system written from scratch in C++17 and CUDA. it takes raw stereo images from the KITTI odometry benchmark and estimates the camera trajectory in real time while building a 3D map of the environment.
+
+it isn't ORB-SLAM3. it doesn't have loop closure detection. it doesn't have an atlas or IMU fusion or relocalization via bag-of-words. what it does have is a clean, readable implementation of the core SLAM pipeline that i actually understand end to end.
 
 ---
 
-## Architecture
+## what it actually does
 
-```
-+----------------------------------------------------------+
-|                        main loop                         |
-|   KittiSequence -> Frame  -->  Tracker::track()          |
-+--------------------+-------------------------------------+
-                     |
-           +---------v----------+
-           |   Tracker          |
-           |  +-------------+  |     GPU
-           |  | ORB extract |--+--> cuda_match_stereo_epipolar()
-           |  | stereo match|  |     (epipolar + disparity filter)
-           |  +------+------+  |
-           |         |         |
-           |  +------v------+  |
-           |  | init/track  |  |
-           |  | motion model|  |
-           |  | PnP-RANSAC  |  |
-           |  +------+------+  |
-           +---------+---------+
-                     | keyframe?
-           +---------v----------+
-           |   LocalBA          |   Ceres SPARSE_SCHUR
-           |   30-KF window     |   StereoReprojCost (3-residual)
-           |   analytical Jac.  |   PitchRollCost (2-residual)
-           |   Huber loss       |   PosePriorCost  (6-residual)
-           +---------+----------+
-                     | every 5 KFs
-           +---------v----------+
-           |   PoseGraph        |   Ceres SPARSE_NORMAL_CHOLESKY
-           |   co-vis edges     |   RelPoseCost (6-residual)
-           +---------+----------+
-                     |
-           +---------v----------+
-           |   Visualizer       |   Rerun TCP --> localhost:9876
-           +--------------------+
-```
+**stereo in, trajectory out.** left and right grayscale images come in, and the system:
+
+1. extracts XFeat deep features (2000 keypoints/frame) via a TorchScript backbone running on GPU
+2. matches stereo pairs on the GPU with epipolar constraints to get metric depth (`Z = fx * b / d`)
+3. tracks frame-to-frame using a constant-velocity model + PnP-RANSAC
+4. runs sliding-window bundle adjustment (30 keyframes, Ceres solver, analytical Jacobians)
+5. checks for new co-visibility constraints every 5 keyframes and runs pose-graph optimization when found
+6. streams everything to [Rerun](https://rerun.io/) for live 3D visualization
+
+no scale ambiguity — stereo gives you real-world meters from frame one. the KITTI baseline is ~0.54m and it triangulates 1000+ map points on the very first frame.
+
+there's also a classical ORB fallback mode for running without PyTorch.
 
 ---
 
-## How It Works
+## the gpu side
 
-### 1. Feature Extraction
+i wrote three CUDA kernels from scratch (Thrust used for the final sort in ANMS, everything else is plain CUDA):
 
-Each frame extracts up to 2000 ORB keypoints on an 8-level pyramid (scale 1.2x). ORB produces binary 256-bit (32-byte) descriptors, stored as 8 x uint32 on the GPU.
+- **FP16 L2 matcher** — one block per query descriptor, 256 threads, warp-shuffle butterfly reduction. half2 vectorization halves memory bandwidth, accumulates in float32 to avoid overflow. used for XFeat temporal matching and relocalization
 
-### 2. GPU Hamming Distance Matching
+- **stereo epipolar matcher** — same architecture but rejects candidate matches that violate row alignment or disparity range before computing distance. runs on every frame to get metric stereo depth
 
-One thread block per query descriptor stripes over the train set in strides of 256, tracking the best and second-best match per thread. Warp-level butterfly reduction packs (dist, idx) into a uint64 for a single min() pass, then thread 0 reduces the 8 warp winners to the final result.
+- **adaptive NMS** — shared-memory tile filter for XFeat heatmap peaks. pass 1 marks local maxima in a (2R+1)² neighbourhood, pass 2 stream-compacts via atomicAdd, thrust sorts by response to keep top-K
 
-Three variants: nearest-neighbor only, Lowe ratio test (0.75), and stereo epipolar which filters by row distance and disparity range before computing Hamming distance.
-
-### 3. Stereo Initialization
-
-Metric depth from a single stereo frame: `Z = fx * b / d`. No temporal baseline, no scale normalization. The baseline comes from the P1 projection matrix (`b = -P1[3] / fx`, about 0.537 m on KITTI seq 00). Constraints: epipolar row tolerance 2 px, disparity range 3--300 px, depth 0.5--150 m.
-
-### 4. Pose Estimation
-
-Constant-velocity model predicts the next pose, then two-phase matching builds 3D-2D correspondences. Phase 1 projects the local map point pool onto the predicted pose and searches a spatial grid with radius scaling from 40 to 120 px based on predicted rotation angle. Phase 2 falls back to GPU Hamming with ratio test if Phase 1 comes up short.
-
-PnP-RANSAC (SQPNP, 5.5 px threshold, 15 inlier minimum) refines the pose. Sanity checks reject candidates with delta rotation > 0.5 rad or delta translation > 5 m. A project-and-search pass after PnP pulls in additional map points without a second RANSAC.
-
-After bundle adjustment, the velocity is invalidated so the stale inter-KF delta is never used as a prediction.
-
-### 5. Bundle Adjustment
-
-Sliding 30-KF window, Ceres SPARSE_SCHUR, Levenberg-Marquardt, 4 threads, 60 iterations. Three cost terms per keyframe:
-
-- **Stereo reprojection** (3 residuals: u_L, v_L, u_R) with analytical Jacobians derived via chain rule through the skew-symmetric rotation Jacobian
-- **Pitch/roll constraint** (2 residuals: R[3] and R[5], both zero when level) with no height reference so there is no drift as the BA window slides
-- **Pose prior** (6 residuals) softly anchors each KF to its pre-BA PnP estimate to prevent divergence in low-feature regions
-
-Huber threshold halves at sharp turns (>0.05 rad inter-KF) to downweight distant features. Post-BA: points with >6 px reprojection error or >150 m stereo depth are marked bad.
-
-### 6. Pose Graph Optimization
-
-Every 5 keyframes, co-visibility edges are added between KF pairs outside the local BA window that share at least 15 map points. The edge stores the relative pose measurement `T_AB = T_A_cw * T_B_cw^-1`. An SE(3) log error cost is minimized with SPARSE_NORMAL_CHOLESKY; oldest KF fixed as gauge anchor.
-
-### 7. Keyframe Selection and Triangulation
-
-A new keyframe is inserted when tracked points fall below 80, or the ratio of current tracked to the previous KF's tracked count falls below 0.8. After insertion: multi-baseline triangulation against the last 3 KFs adds map points from unmatched keypoints, then stereo enrichment fills any remaining unmapped keypoints with metric-depth points.
-
-### 8. Relocalization and Recovery
-
-On tracking loss the system coasts for up to 8 frames using the last velocity. If coasting fails, it builds a descriptor pool from the entire map, runs GPU matching, and attempts PnP with a 30-inlier threshold. On failure the map resets: keyframes are archived to a persistent trajectory history, the system reinitializes from the last known pose, and the Rerun path never disappears.
+the L2 matchers run fully asynchronously on CUDA streams. the NMS syncs once between passes to read the candidate count back to the CPU.
 
 ---
 
-## Visualization
+## bundle adjustment
 
-Streamed in real time via [Rerun](https://rerun.io/) over TCP to `localhost:9876`.
+the BA is the part i'm most proud of and the part that took the longest to get right. it's a sliding-window optimizer over the last 30 keyframes using Ceres with SPARSE_SCHUR.
 
-| Entity path | Type | Update |
-|---|---|---|
-| `world/camera/image` | Pinhole + Transform3D + Image | Every frame |
-| `world/camera/image/keypoints` | Points2D (purple) | Every frame |
-| `world/trajectory` | LineStrips3D (green) | Every frame |
-| `world/map/points` | Points3D (white) | Every keyframe |
-| `world/ground_truth/trajectory` | LineStrips3D (orange) | Once (static) |
+the analytical Jacobians are hand-derived — the stereo cost function has 3 residuals (left u, left v, right u) and i work out the full chain rule through the quaternion rotation, projection, and disparity. it's not pretty but it works and it's fast.
 
-The trajectory is rebuilt from the full archive each frame and split into segments at 50 m spatial gaps to handle reinit discontinuities.
+there's also a Schur complement marginalization prior that summarizes information from keyframes that slide out of the window, so the system doesn't just forget everything behind it.
+
+what the BA does NOT have: any kind of pitch/roll constraint or pose prior. i tried both — they caused more problems than they solved. the BA runs unconstrained (except fixing the oldest keyframe for gauge freedom) and that turns out to be enough.
 
 ---
 
-## Configuration
+## the state machine
 
-All tunable parameters live in `Tracker::Config` ([include/slam/tracker.hpp](include/slam/tracker.hpp)) and `LocalBA::Config` / `PoseGraph::Config` in their respective headers.
+tracking isn't just "run PnP every frame." the system has five states:
 
-| Parameter | Value | Effect |
-|---|---|---|
-| `orb_features` | 2000 | Features per frame |
-| `hamming_threshold` | 60 | Max Hamming for valid match |
-| `lowe_ratio` | 0.75 | Ratio test threshold |
-| `pnp_reprojection` | 5.5 px | RANSAC inlier threshold |
-| `pnp_min_inliers` | 15 | Minimum PnP inliers |
-| `stereo_epi_tol` | 2.0 px | Epipolar band for stereo match |
-| `stereo_d_min` | 3.0 px | Min disparity (~128 m max depth) |
-| `stereo_d_max` | 300.0 px | Max disparity (~1.3 m min depth) |
-| `kWindowSize` | 30 KFs | Local BA + tracking pool window |
-| `huber_delta` | 1.0 px | BA Huber loss threshold |
-| `pgo_interval` | 5 KFs | How often PGO runs |
-| `min_shared_points` | 15 | Co-visibility edge threshold |
+- **NOT_INITIALIZED** — waiting for a good stereo frame to bootstrap
+- **OK** — normal tracking, constant-velocity prediction + PnP refinement
+- **COASTING** — lost the current frame but predicting forward with the last velocity for up to 8 frames, hoping to recover
+- **LOST** — coasting failed, attempting relocalization against the full map
+- **RELOCALIZING** — trying to find where we are by matching against all known map points
+
+when relocalization fails, the map resets — but archived keyframes are preserved so the trajectory visualization never disappears. the system reinitializes from the last known pose and keeps going.
 
 ---
 
-## Dependencies
+## what's honest about performance
 
-| Dependency | Version | Source |
-|---|---|---|
-| MSVC | 19.x (VS 2022) | |
-| CUDA Toolkit | 12.x | |
-| CMake | 3.20+ | |
-| OpenCV | 4.x (core, features2d, calib3d, highgui) | vcpkg |
-| Ceres Solver | 2.x (eigensparse + schur) | vcpkg |
-| Eigen3 | 3.4+ | vcpkg |
-| Rerun SDK | 0.22.1 | CMake FetchContent (auto) |
+i'm not going to quote drift percentages i haven't rigorously measured. here's what i can say:
 
-GPU target: Compute Capability 8.6 (RTX 30xx/40xx). Change `CMAKE_CUDA_ARCHITECTURES` in [CMakeLists.txt](CMakeLists.txt) for other cards (e.g. `75` for RTX 20xx, `89` for RTX 40xx).
+- it runs. it tracks through KITTI sequence 00 (4541 frames, ~3.7km) without getting permanently lost
+- stereo initialization gives metric scale from frame one — no scale drift from monocular bootstrapping
+- it's ~6-7 FPS on my RTX 3050 laptop — the TorchScript XFeat inference is the bottleneck
+- the trajectory visually follows ground truth closely on straight sections and drifts at sharp turns (no loop closure to correct this)
+- it handles the KITTI 00 highway-to-residential transition without dying, which was genuinely hard
+
+things that don't work well:
+- no loop closure means drift accumulates and never gets corrected
+- LighterGlue TorchScript export is broken (assertion failure) — when LOST in hybrid mode, relocalization fails and the map resets
+- i haven't tested on anything other than KITTI
 
 ---
 
-## Build
+## building it
+
+you need Windows, MSVC (VS 2022), CUDA 12.x, vcpkg, and PyTorch 2.1+ with CUDA.
 
 ```bat
-:: install vcpkg dependencies
-cd C:\Users\<you>\vcpkg
+:: pytorch (required for XFeat deep frontend)
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+:: vcpkg dependencies
 vcpkg install opencv4[core,features2d,calib3d,highgui] --triplet x64-windows
 vcpkg install ceres[eigensparse,schur] --triplet x64-windows
 vcpkg install eigen3 --triplet x64-windows
-vcpkg integrate install
 
-:: configure and build
-cmake -B build ^
-  -DCMAKE_TOOLCHAIN_FILE=C:/Users/<you>/vcpkg/scripts/buildsystems/vcpkg.cmake ^
-  -DCMAKE_BUILD_TYPE=Release
+:: build
+cmake -B build -DENABLE_DEEP_FRONTEND=ON -DCMAKE_TOOLCHAIN_FILE=<your-vcpkg>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
 
-Rerun SDK is downloaded automatically on first configure.
+Rerun SDK (0.22.1) downloads automatically via FetchContent — no separate install needed.
+
+to build without PyTorch (classical ORB mode only), omit `-DENABLE_DEEP_FRONTEND=ON`.
 
 ---
 
-## Dataset Setup
-
-Download [KITTI Odometry](https://www.cvlibs.net/datasets/kitti/eval_odometry.php) and place it under:
-
-```
-VSLAM/data/dataset/
-  poses/00.txt
-  sequences/00/
-    calib.txt
-    times.txt
-    image_0/000000.png ...
-    image_1/000000.png ...
-```
-
-Stereo mode activates automatically when `image_1/` is present. Without it, the system falls back to monocular initialization with median-depth scale normalization.
-
----
-
-## Run
+## running it
 
 ```bat
-cd C:\...\VSLAM
-build\Release\vslam.exe --sequence data/dataset/sequences/00
+:: download KITTI odometry: https://www.cvlibs.net/datasets/kitti/eval_odometry.php
+:: place under data/dataset/sequences/00/ (with image_0/, image_1/, calib.txt, times.txt)
+
+build\Release\vslam.exe --sequence data/dataset/sequences/00 --hybrid --xfeat models/xfeat.pt
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--sequence <path>` | required | KITTI sequence directory |
-| `--start <N>` | 0 | First frame index |
-| `--end <N>` | last | Last frame index |
-| `--no-viz` | off | Disable Rerun visualization |
+launch Rerun (`rerun`) before or alongside — the viewer connects on `127.0.0.1:9876`.
 
-Launch Rerun before or alongside SLAM. The viewer connects to `127.0.0.1:9876`.
+flags: `--start N`, `--end N`, `--no-viz`
+
+---
+
+## project structure
+
+```
+VSLAM/
+├── src/                    C++ implementations (tracker, BA, map, PGO, visualizer, main)
+├── include/slam/           headers for the SLAM pipeline
+├── include/cuda/           CUDA kernel declarations
+├── cuda/                   GPU kernels (L2 FP16, stereo epipolar, adaptive NMS)
+├── include/deep/           deep frontend headers (XFeat, LighterGlue, semi-dense)
+├── models/                 exported TorchScript models
+├── data/dataset/           KITTI sequences + ground truth poses
+└── CMakeLists.txt          build config (CUDA arch=86, vcpkg, FetchContent Rerun)
+```
+
+---
+
+## where this is going
+
+this is a personal project. i built it to learn, and i learned a lot — about how fragile visual tracking really is, about how much of SLAM is just making the edge cases not explode, about how analytical Jacobians are worth the pain. i'm still working on it. the next things i want to tackle are loop closure, TensorRT for the deep frontend, and testing on more sequences.
+
+if you read this far — thanks. feel free to look around the code. it's not perfect but it's mine.
