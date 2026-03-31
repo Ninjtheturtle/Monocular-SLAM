@@ -1,6 +1,6 @@
 # Stereo-SLAM: A Custom VSLAM Engine
 
-This is my first iteration of implementing a Visual SLAM (Simultaneous Localization and Mapping) engine entirely from scratch. Built in C++17 and CUDA, the goal of this project was to dive deep into the math, parallel processing, and architecture required to build a real-time SLAM system tailored for the KITTI odometry benchmark.
+This is my first iteration of implementing a Visual SLAM engine entirely from scratch. Built in C++17 and CUDA, the goal of this project was to dive deep into the math, parallel processing, and architecture required to build a real-time SLAM system.
 
 It's rough around the edges and absolutely has limitations (see below), but it serves as a hands-on demonstration of stitching together modern computer vision, non-linear optimization, and custom GPU acceleration.
 
@@ -28,7 +28,7 @@ The engine is built around a standard front-end/back-end SLAM architecture, favo
 *   **Telemetry & Viz**: Rerun SDK
 *   **Dependencies**: Migrated to `vcpkg` for sane package management in C++.
 
-## Limitations and Flaws (The Reality Check)
+## Limitations and Flaws
 
 Because this is a first-pass VSLAM implementation, there are distinct trade-offs, flaws, and areas for improvement:
 
