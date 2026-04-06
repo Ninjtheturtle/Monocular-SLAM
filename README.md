@@ -64,8 +64,7 @@ tracking isn't just "run PnP every frame." the system has five states:
 - **NOT_INITIALIZED** — waiting for a good stereo frame to bootstrap
 - **OK** — normal tracking, constant-velocity prediction + PnP refinement
 - **COASTING** — lost the current frame but predicting forward with the last velocity for up to 8 frames, hoping to recover
-- **LOST** — coasting failed, attempting relocalization against the full map
-- **RELOCALIZING** — trying to find where we are by matching against all known map points
+- **LOST** — coasting failed, attempting synchronous relocalization against the full map then resetting
 
 when relocalization fails, the map resets — but archived keyframes are preserved so the trajectory visualization never disappears. the system reinitializes from the last known pose and keeps going.
 
@@ -83,7 +82,6 @@ i'm not going to quote drift percentages i haven't rigorously measured. here's w
 
 things that don't work well:
 - no loop closure means drift accumulates and never gets corrected
-- LighterGlue TorchScript export is broken (assertion failure) — when LOST in hybrid mode, relocalization fails and the map resets
 - i haven't tested on anything other than KITTI
 
 ---
@@ -118,7 +116,7 @@ to build without PyTorch (classical ORB mode only), omit `-DENABLE_DEEP_FRONTEND
 :: download KITTI odometry: https://www.cvlibs.net/datasets/kitti/eval_odometry.php
 :: place under data/dataset/sequences/00/ (with image_0/, image_1/, calib.txt, times.txt)
 
-build\Release\vslam.exe --sequence data/dataset/sequences/00 --hybrid --xfeat models/xfeat.pt
+.\build\vslam.exe --sequence data/dataset/sequences/00 --hybrid --xfeat models/xfeat.pt
 ```
 
 launch Rerun (`rerun`) before or alongside — the viewer connects on `127.0.0.1:9876`.
@@ -135,7 +133,7 @@ VSLAM/
 ├── include/slam/           headers for the SLAM pipeline
 ├── include/cuda/           CUDA kernel declarations
 ├── cuda/                   GPU kernels (L2 FP16, stereo epipolar, adaptive NMS)
-├── include/deep/           deep frontend headers (XFeat, LighterGlue, semi-dense)
+├── include/deep/           deep frontend headers (XFeat, semi-dense)
 ├── models/                 exported TorchScript models
 ├── data/dataset/           KITTI sequences + ground truth poses
 └── CMakeLists.txt          build config (CUDA arch=86, vcpkg, FetchContent Rerun)

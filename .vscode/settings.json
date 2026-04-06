@@ -39,5 +39,6 @@
 
   // ─── IntelliSense ─────────────────────────────────────────────────────────
   "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
-  "C_Cpp.intelliSenseEngine": "default"
+  "C_Cpp.intelliSenseEngine": "default",
+  "liveServer.settings.port": 5501
 }

@@ -46,7 +46,7 @@ std::vector<SemiDensePoint3D> SemiDenseDisparity::compute(const cv::Mat& feat_le
 
     for (int r = 0; r < fh; ++r) {
         for (int c_left = 0; c_left < fw; ++c_left) {
-            // --- L2-normalize left descriptor ---
+            // L2-normalize left descriptor
             float norm2 = 0.0f;
             for (int ch = 0; ch < C; ++ch) {
                 float v = L_ptr[ch * fh * fw + r * fw + c_left];
@@ -55,7 +55,7 @@ std::vector<SemiDensePoint3D> SemiDenseDisparity::compute(const cv::Mat& feat_le
             if (norm2 < 1e-8f) continue;
             float inv_norm_L = 1.0f / std::sqrt(norm2);
 
-            // --- 1D epipolar search (same row assumption — valid for rectified stereo) ---
+            // 1D epipolar search (same row assumption — valid for rectified stereo)
             int d_lo = (int)std::ceil(d_min_8);
             int d_hi = (int)std::floor(d_max_8);
             d_lo = std::max(d_lo, 0);

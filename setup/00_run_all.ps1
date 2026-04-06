@@ -34,7 +34,7 @@ Write-Host "━━━ STEP 2/4: libtorch ━━━" -ForegroundColor Yellow
 
 # ── Step 3: Export models ─────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "━━━ STEP 3/4: Export XFeat + LightGlue engines ━━━" -ForegroundColor Yellow
+Write-Host "━━━ STEP 3/4: Export XFeat engine ━━━" -ForegroundColor Yellow
 python "$scriptDir\03_export_models.py"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Model export failed — check error above." -ForegroundColor Red
@@ -54,6 +54,5 @@ Write-Host "║  cd $root" -ForegroundColor Green
 Write-Host "║  build_hybrid\Release\vslam.exe \`" -ForegroundColor Green
 Write-Host "║    --sequence data/dataset/sequences/00 \`" -ForegroundColor Green
 Write-Host "║    --hybrid \`" -ForegroundColor Green
-Write-Host "║    --xfeat models/xfeat_fp16.engine \`" -ForegroundColor Green
-Write-Host "║    --lg    models/lighterglue_fp16.engine" -ForegroundColor Green
+Write-Host "║    --xfeat models/xfeat_fp16.engine" -ForegroundColor Green
 Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green

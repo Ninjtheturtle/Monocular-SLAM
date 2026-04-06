@@ -9,10 +9,8 @@
 // fwd-declare deep components to avoid pulling torch/TRT into every TU
 namespace deep {
 class XFeatExtractor;
-class LighterGlueAsync;
 class TTTLoopDetector;
 struct XFeatResult;
-struct RelocResult;
 }
 
 namespace slam {
@@ -21,8 +19,7 @@ enum class TrackingState {
     NOT_INITIALIZED,  // waiting for stereo/mono init
     OK,               // normal tracking
     COASTING,         // tracking failed; dead-reckoning w/ velocity model
-    LOST,             // coasting limit exceeded; awaiting LG reloc
-    RELOCALIZING      // LG job submitted; polling for async result
+    LOST              // coasting limit exceeded; attempting relocalization
 };
 
 // front-end tracker — hybrid deep-geometric pipeline:
@@ -31,9 +28,8 @@ enum class TrackingState {
 //   3. constant-velocity prediction -> FP16 L2 match -> PnP RANSAC
 //   4. L2 ratio confidence -> match_confidence[]
 //   5. coast up to 8 frames before LOST
-//   6. LOST -> async LG reloc (non-blocking)
-//   7. RELOCALIZING -> poll LG each frame; apply on success
-//   8. KF insertion -> push descs to TTT loop detector
+//   6. LOST -> synchronous relocalize or map reset
+//   7. KF insertion -> push descs to TTT loop detector
 class Tracker {
 public:
     struct Config {
@@ -71,7 +67,6 @@ public:
     static Ptr create_hybrid(
         const Camera& cam, Map::Ptr map,
         std::shared_ptr<deep::XFeatExtractor>  xfeat,
-        std::shared_ptr<deep::LighterGlueAsync> lighter_glue,
         std::shared_ptr<deep::TTTLoopDetector>  ttt,
         const Config& cfg = Config{});
 
@@ -105,10 +100,6 @@ private:
         std::vector<float>& out_confidence
     );
 
-    // submit async LG reloc job; returns false if LG busy
-    bool submit_reloc_job(Frame::Ptr frame);
-    bool apply_reloc_result(Frame::Ptr frame, const deep::RelocResult& result);
-
     // GPU Hamming matcher w/ ratio test
     std::vector<cv::DMatch> match_descriptors(
         const cv::Mat& query_desc,
@@ -134,7 +125,6 @@ private:
 
     // deep frontend (null in non-hybrid mode)
     std::shared_ptr<deep::XFeatExtractor>   xfeat_;
-    std::shared_ptr<deep::LighterGlueAsync> lighter_glue_;
     std::shared_ptr<deep::TTTLoopDetector>  ttt_;
     bool hybrid_mode_ = false;
 
@@ -161,7 +151,6 @@ private:
     void recompute_velocity_from_ba();
 
     int lost_streak_     = 0;
-    int reloc_wait_frames_ = 0;  // frames since LG job was submitted
 };
 
 }  // namespace slam

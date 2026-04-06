@@ -6,7 +6,9 @@
         "${workspaceFolder}/include",
         "${workspaceFolder}/build/_deps/rerun_sdk-src/rerun_cpp/src",
         "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/include",
-        "C:/Users/nengj/vcpkg/installed/x64-windows/include"
+        "C:/Users/nengj/vcpkg/installed/x64-windows/include",
+        "C:/Users/nengj/AppData/Local/Programs/Python/Python310/lib/site-packages/torch/include",
+        "C:/Users/nengj/AppData/Local/Programs/Python/Python310/lib/site-packages/torch/include/torch/csrc/api/include"
       ],
       "defines": [
         "_WIN32",

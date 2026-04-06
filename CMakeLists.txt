@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+
+# ─── CUDA Architecture (RTX 3050 Laptop = Ampere SM86) ───────────────────────
+# Must be set before project() — project() triggers CUDA compiler detection
+# and reads CMAKE_CUDA_ARCHITECTURES at that point.
+set(CMAKE_CUDA_ARCHITECTURES 86)
+
 project(VSLAM LANGUAGES CXX CUDA)
 
 # ─── Language Standards ──────────────────────────────────────────────────────
@@ -21,9 +27,6 @@ if(MSVC AND NOT CMAKE_CXX_COMPILE_FEATURES)
   set(CMAKE_CXX20_COMPILE_FEATURES  "cxx_std_20"  CACHE INTERNAL "" FORCE)
   set(CMAKE_CXX23_COMPILE_FEATURES  "cxx_std_23"  CACHE INTERNAL "" FORCE)
 endif()
-
-# ─── CUDA Architecture (RTX 3050 Laptop = Ampere SM86) ───────────────────────
-set(CMAKE_CUDA_ARCHITECTURES 86)
 
 # ─── Build Type Defaults ─────────────────────────────────────────────────────
 if(NOT CMAKE_BUILD_TYPE)
@@ -69,10 +72,10 @@ unset(_arrow_cmake)
 
 add_subdirectory("${rerun_sdk_SOURCE_DIR}" "${rerun_sdk_BINARY_DIR}")
 
-# ─── Optional: Deep Frontend (libtorch + TorchScript XFeat/LighterGlue/TTT) ──
-# XFeat and LighterGlue are loaded as TorchScript .pt models via libtorch.
+# ─── Optional: Deep Frontend (libtorch + TorchScript XFeat/TTT) ──────────────
+# XFeat is loaded as a TorchScript .pt model via libtorch.
 # TensorRT is NOT required for inference — only libtorch is needed.
-option(ENABLE_DEEP_FRONTEND "Build hybrid XFeat/LighterGlue/TTT pipeline" OFF)
+option(ENABLE_DEEP_FRONTEND "Build hybrid XFeat/TTT pipeline" OFF)
 
 if(ENABLE_DEEP_FRONTEND)
   # --- libtorch (required) ---
@@ -148,7 +151,7 @@ if(ENABLE_DEEP_FRONTEND)
   endforeach()
 
   # --- TensorRT (optional, only for CUDA ANMS/L2 kernels) ---
-  # Not required for XFeat/LighterGlue inference (those use TorchScript).
+  # Not required for XFeat inference (uses TorchScript).
   if(NOT DEFINED TRT_ROOT)
     set(TRT_ROOT "C:/TensorRT" CACHE PATH "TensorRT root (optional, for headers only)")
   endif()
@@ -213,7 +216,6 @@ set(VSLAM_SOURCES
 if(ENABLE_DEEP_FRONTEND)
   list(APPEND VSLAM_SOURCES
     src/xfeat_extractor.cu
-    src/lighterglue_async.cpp
     src/ttt_autoencoder.cpp
     src/semi_dense_disparity.cpp
   )

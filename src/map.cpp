@@ -3,7 +3,7 @@
 
 namespace slam {
 
-// --- kf management ---
+// kf management
 
 void Map::insert_keyframe(Frame::Ptr kf)
 {
@@ -60,7 +60,7 @@ std::vector<Frame::Ptr> Map::local_window(int size) const
         keyframe_order_.begin() + start, keyframe_order_.end());
 }
 
-// --- map point management ---
+// map point management
 
 void Map::insert_map_point(MapPoint::Ptr mp)
 {
@@ -147,7 +147,7 @@ int Map::count_shared_map_points(long kf_id_a, long kf_id_b) const
     return count;
 }
 
-// --- covis graph ---
+// covis graph
 
 void Map::update_covisibility(long kf_id, MapPoint::Ptr mp)
 {

@@ -23,7 +23,7 @@
 
 namespace slam {
 
-// --- init ---
+// init
 
 Visualizer::Ptr Visualizer::create(const Config& cfg)
 {

@@ -1,10 +1,9 @@
 """
-Step 3: Export XFeat and LighterGlue (from accelerated_features repo) to ONNX,
-        then to TensorRT FP16 engines.
+Step 3: Export XFeat (from accelerated_features repo) to ONNX,
+        then to a TensorRT FP16 engine.
 
 Run:  python setup/03_export_models.py
 Out:  models/xfeat_fp16.engine
-      models/lighterglue_fp16.engine
 """
 
 import subprocess, sys, os, tempfile
@@ -17,7 +16,7 @@ MODELS.mkdir(exist_ok=True)
 ONNX_DIR.mkdir(exist_ok=True)
 
 TMP = Path(tempfile.gettempdir())
-AF_DIR = TMP / "accelerated_features"   # XFeat + LighterGlue repo
+AF_DIR = TMP / "accelerated_features"   # XFeat repo
 
 
 def pip_install(*pkgs):
@@ -29,7 +28,7 @@ print("Installing Python deps...")
 pip_install("onnx>=1.16", "onnxruntime-gpu", "kornia", "einops")
 
 if not AF_DIR.exists():
-    print("Cloning accelerated_features (XFeat + LighterGlue)...")
+    print("Cloning accelerated_features (XFeat)...")
     subprocess.check_call(["git", "clone", "--depth", "1",
         "https://github.com/verlab/accelerated_features.git", str(AF_DIR)])
     # Add minimal setup.py so pip can install it
@@ -44,8 +43,7 @@ import torch, tensorrt as trt, torch.nn as nn
 print(f"PyTorch  : {torch.__version__}")
 print(f"TensorRT : {trt.__version__}")
 
-from modules.xfeat     import XFeat
-from modules.lighterglue import LighterGlue as LighterGlueModel
+from modules.xfeat import XFeat
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_W, IMG_H = 1242, 376
@@ -89,50 +87,7 @@ with torch.no_grad():
     )
 print("  XFeat ONNX OK")
 
-# ── 2. Export LighterGlue ─────────────────────────────────────────────────────
-print("\n=== Exporting LighterGlue to ONNX ===")
-
-class LighterGlueWrapper(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.lg = LighterGlueModel(input_dim=64, depth=4, num_heads=4)
-        self.lg.eval()
-
-    def forward(self, kps0, desc0, kps1, desc1):
-        # kps: (1,N,2) float32;  desc: (1,N,64) float32
-        matches, scores = self.lg(kps0, desc0, kps1, desc1)
-        return matches, scores   # (1,N) int64, (1,N) float32
-
-lg_wrapper  = LighterGlueWrapper().to(DEVICE).eval()
-N = M       = 512
-dummy_kps0  = torch.zeros(1, N, 2,  device=DEVICE)
-dummy_desc0 = torch.zeros(1, N, 64, device=DEVICE)
-dummy_kps1  = torch.zeros(1, M, 2,  device=DEVICE)
-dummy_desc1 = torch.zeros(1, M, 64, device=DEVICE)
-lg_onnx     = str(ONNX_DIR / "lighterglue.onnx")
-
-print(f"  Tracing -> {lg_onnx}")
-with torch.no_grad():
-    torch.onnx.export(
-        lg_wrapper,
-        (dummy_kps0, dummy_desc0, dummy_kps1, dummy_desc1),
-        lg_onnx,
-        input_names=["kps0", "desc0", "kps1", "desc1"],
-        output_names=["matches", "scores"],
-        dynamic_axes={
-            "kps0":    {0: "batch", 1: "N"},
-            "desc0":   {0: "batch", 1: "N"},
-            "kps1":    {0: "batch", 1: "M"},
-            "desc1":   {0: "batch", 1: "M"},
-            "matches": {0: "batch", 1: "N"},
-            "scores":  {0: "batch", 1: "N"},
-        },
-        opset_version=17,
-        do_constant_folding=True,
-    )
-print("  LighterGlue ONNX OK")
-
-# ── 3. ONNX → TRT FP16 ───────────────────────────────────────────────────────
+# ── 2. ONNX → TRT FP16 ───────────────────────────────────────────────────────
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 def build_fp16_engine(onnx_path, engine_path, min_sh, opt_sh, max_sh):
@@ -174,24 +129,12 @@ build_fp16_engine(
     max_sh={"image": (2, 1, IMG_H, IMG_W)},
 )
 
-print("\n=== Building LighterGlue TRT FP16 engine ===")
-build_fp16_engine(
-    lg_onnx, str(MODELS / "lighterglue_fp16.engine"),
-    min_sh={"kps0": (1, 100, 2),  "desc0": (1, 100, 64),
-            "kps1": (1, 100, 2),  "desc1": (1, 100, 64)},
-    opt_sh={"kps0": (1, 512, 2),  "desc0": (1, 512, 64),
-            "kps1": (1, 512, 2),  "desc1": (1, 512, 64)},
-    max_sh={"kps0": (1, 2000, 2), "desc0": (1, 2000, 64),
-            "kps1": (1, 2000, 2), "desc1": (1, 2000, 64)},
-)
-
 print("\n=== DONE ===")
 print(f"  {MODELS}/xfeat_fp16.engine")
-print(f"  {MODELS}/lighterglue_fp16.engine")
 print("\nBuild the project:")
 print("  cmake -B build_hybrid -DENABLE_DEEP_FRONTEND=ON -DTRT_ROOT=C:/TensorRT")
 print('           -DTorch_DIR="C:/libtorch/share/cmake/Torch" ..')
 print("  cmake --build build_hybrid --config Release")
 print("\nRun:")
 print("  build_hybrid\\Release\\vslam.exe --sequence data/dataset/sequences/00")
-print("    --hybrid --xfeat models/xfeat_fp16.engine --lg models/lighterglue_fp16.engine")
+print("    --hybrid --xfeat models/xfeat_fp16.engine")

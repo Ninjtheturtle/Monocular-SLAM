@@ -1,65 +1,54 @@
 #include "slam/tracker.hpp"
-#include "slam/map_point.hpp"
+
 #include "cuda/hamming_matcher.cuh"
 #include "cuda/l2_matcher.cuh"
+#include "slam/map_point.hpp"
 
 // deep frontend — only pull in when hybrid mode is compiled
-#include "deep/xfeat_extractor.hpp"
-#include "deep/lighterglue_async.hpp"
-#include "deep/ttt_autoencoder.hpp"
-
-#include <opencv2/calib3d.hpp>
-#include <opencv2/imgproc.hpp>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 #include <Eigen/SVD>
-#include <iostream>
 #include <atomic>
-#include <unordered_set>
+#include <iostream>
 #include <numeric>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
+#include <unordered_set>
+
+#include "deep/ttt_autoencoder.hpp"
+#include "deep/xfeat_extractor.hpp"
 
 namespace slam {
 
 static std::atomic<long> g_frame_id{0};  // global atomic ID counters
 static std::atomic<long> g_point_id{0};
 
-// --- factory ---
+// factory
 
-Tracker::Ptr Tracker::create(const Camera& cam, Map::Ptr map, const Config& cfg)
-{
+Tracker::Ptr Tracker::create(const Camera& cam, Map::Ptr map, const Config& cfg) {
     auto t = std::shared_ptr<Tracker>(new Tracker());
     t->cam_ = cam;
     t->map_ = map;
     t->cfg_ = cfg;
-    t->orb_ = cv::ORB::create(
-        cfg.orb_features,
-        cfg.orb_scale_factor,
-        cfg.orb_levels,
-        cfg.orb_edge_threshold
-    );
+    t->orb_ = cv::ORB::create(cfg.orb_features, cfg.orb_scale_factor, cfg.orb_levels,
+                              cfg.orb_edge_threshold);
     return t;
 }
 
-Tracker::Ptr Tracker::create_hybrid(
-    const Camera& cam, Map::Ptr map,
-    std::shared_ptr<deep::XFeatExtractor>   xfeat,
-    std::shared_ptr<deep::LighterGlueAsync> lighter_glue,
-    std::shared_ptr<deep::TTTLoopDetector>  ttt,
-    const Config& cfg)
-{
+Tracker::Ptr Tracker::create_hybrid(const Camera& cam, Map::Ptr map,
+                                    std::shared_ptr<deep::XFeatExtractor> xfeat,
+                                    std::shared_ptr<deep::TTTLoopDetector> ttt, const Config& cfg) {
     auto t = create(cam, map, cfg);  // ORB still init'd as fallback
-    t->xfeat_        = std::move(xfeat);
-    t->lighter_glue_ = std::move(lighter_glue);
-    t->ttt_          = std::move(ttt);
-    t->hybrid_mode_  = true;
+    t->xfeat_ = std::move(xfeat);
+    t->ttt_ = std::move(ttt);
+    t->hybrid_mode_ = true;
     return t;
 }
 
-// --- hybrid feature extraction ---
+// hybrid feature extraction
 
-void Tracker::extract_features_hybrid(Frame::Ptr frame)
-{
+void Tracker::extract_features_hybrid(Frame::Ptr frame) {
     deep::XFeatResult res;
     try {
         res = xfeat_->extract(frame->image_gray);
@@ -78,8 +67,8 @@ void Tracker::extract_features_hybrid(Frame::Ptr frame)
     frame->match_confidence.assign(res.N, 1.0f);
 
     for (int i = 0; i < res.N; ++i) {
-        frame->keypoints[i].pt.x    = res.kp_x[i];
-        frame->keypoints[i].pt.y    = res.kp_y[i];
+        frame->keypoints[i].pt.x = res.kp_x[i];
+        frame->keypoints[i].pt.y = res.kp_y[i];
         frame->keypoints[i].response = res.scores[i];
     }
 
@@ -94,9 +83,9 @@ void Tracker::extract_features_hybrid(Frame::Ptr frame)
 
     // device->host copy of feat_map for semi-dense disparity at KF insertion
     if (res.feat_map_device && res.feat_map_h > 0 && res.feat_map_w > 0) {
-        int C   = deep::kXFeatFeatMapC;
-        int fh  = res.feat_map_h;
-        int fw  = res.feat_map_w;
+        int C = deep::kXFeatFeatMapC;
+        int fh = res.feat_map_h;
+        int fw = res.feat_map_w;
         frame->feat_map_left = cv::Mat(C * fh, fw, CV_32F);
         cudaMemcpy(frame->feat_map_left.ptr<float>(), res.feat_map_device,
                    C * fh * fw * sizeof(float), cudaMemcpyDeviceToHost);
@@ -107,8 +96,8 @@ void Tracker::extract_features_hybrid(Frame::Ptr frame)
         auto res_r = xfeat_->extract(frame->image_right);
         frame->keypoints_right.resize(res_r.N);
         for (int i = 0; i < res_r.N; ++i) {
-            frame->keypoints_right[i].pt.x    = res_r.kp_x[i];
-            frame->keypoints_right[i].pt.y    = res_r.kp_y[i];
+            frame->keypoints_right[i].pt.x = res_r.kp_x[i];
+            frame->keypoints_right[i].pt.y = res_r.kp_y[i];
             frame->keypoints_right[i].response = res_r.scores[i];
         }
 
@@ -142,19 +131,16 @@ void Tracker::extract_features_hybrid(Frame::Ptr frame)
                 y_t[i] = frame->keypoints_right[i].pt.y;
                 x_t[i] = frame->keypoints_right[i].pt.x;
             }
-            cudaMemcpy(d_y_q_, y_q.data(), res.N   * sizeof(float), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_x_q_, x_q.data(), res.N   * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_y_q_, y_q.data(), res.N * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_x_q_, x_q.data(), res.N * sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_y_t_, y_t.data(), res_r.N * sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_x_t_, x_t.data(), res_r.N * sizeof(float), cudaMemcpyHostToDevice);
 
-            cuda_match_l2_stereo_epipolar(
-                d_query_descs_, d_train_descs_,
-                d_y_q_, d_y_t_, d_x_q_, d_x_t_,
-                res.N, res_r.N, deep::kXFeatDescDim,
-                cfg_.stereo_epi_tol, cfg_.stereo_d_min, cfg_.stereo_d_max,
-                cfg_.l2_ratio,
-                d_best_idx_, d_best_dist_, d_pseudo_conf_,
-                /*stream=*/0);
+            cuda_match_l2_stereo_epipolar(d_query_descs_, d_train_descs_, d_y_q_, d_y_t_, d_x_q_,
+                                          d_x_t_, res.N, res_r.N, deep::kXFeatDescDim,
+                                          cfg_.stereo_epi_tol, cfg_.stereo_d_min, cfg_.stereo_d_max,
+                                          cfg_.l2_ratio, d_best_idx_, d_best_dist_, d_pseudo_conf_,
+                                          /*stream=*/0);
             cudaDeviceSynchronize();
 
             std::vector<int> best_idx(res.N);
@@ -169,38 +155,40 @@ void Tracker::extract_features_hybrid(Frame::Ptr frame)
     }
 }
 
-// --- L2 buffer management ---
+// L2 buffer management
 
-void Tracker::ensure_l2_buffers(int N_q, int N_t)
-{
+void Tracker::ensure_l2_buffers(int N_q, int N_t) {
     int needed = std::max(N_q, N_t);
     if (needed <= d_buf_capacity_) return;
 
-    cudaFree(d_query_descs_); cudaFree(d_train_descs_);
-    cudaFree(d_best_idx_);    cudaFree(d_best_dist_); cudaFree(d_pseudo_conf_);
-    cudaFree(d_y_q_); cudaFree(d_y_t_);
-    cudaFree(d_x_q_); cudaFree(d_x_t_);
+    cudaFree(d_query_descs_);
+    cudaFree(d_train_descs_);
+    cudaFree(d_best_idx_);
+    cudaFree(d_best_dist_);
+    cudaFree(d_pseudo_conf_);
+    cudaFree(d_y_q_);
+    cudaFree(d_y_t_);
+    cudaFree(d_x_q_);
+    cudaFree(d_x_t_);
 
     int cap = needed + 512;  // +512 slack to avoid reallocing every call
     cudaMalloc(&d_query_descs_, cap * deep::kXFeatDescDim * sizeof(__half));
     cudaMalloc(&d_train_descs_, cap * deep::kXFeatDescDim * sizeof(__half));
-    cudaMalloc(&d_best_idx_,    cap * sizeof(int));
-    cudaMalloc(&d_best_dist_,   cap * sizeof(float));
+    cudaMalloc(&d_best_idx_, cap * sizeof(int));
+    cudaMalloc(&d_best_dist_, cap * sizeof(float));
     cudaMalloc(&d_pseudo_conf_, cap * sizeof(float));
-    cudaMalloc(&d_y_q_,         cap * sizeof(float));
-    cudaMalloc(&d_y_t_,         cap * sizeof(float));
-    cudaMalloc(&d_x_q_,         cap * sizeof(float));
-    cudaMalloc(&d_x_t_,         cap * sizeof(float));
+    cudaMalloc(&d_y_q_, cap * sizeof(float));
+    cudaMalloc(&d_y_t_, cap * sizeof(float));
+    cudaMalloc(&d_x_q_, cap * sizeof(float));
+    cudaMalloc(&d_x_t_, cap * sizeof(float));
     d_buf_capacity_ = cap;
 }
 
-// --- FP16 L2 match (returns DMatch list + confidence) ---
+// FP16 L2 match (returns DMatch list + confidence)
 
-std::vector<cv::DMatch> Tracker::match_l2_fp16(
-    const cv::Mat& query_descs_fp32,
-    const cv::Mat& train_descs_fp32,
-    std::vector<float>& out_confidence)
-{
+std::vector<cv::DMatch> Tracker::match_l2_fp16(const cv::Mat& query_descs_fp32,
+                                               const cv::Mat& train_descs_fp32,
+                                               std::vector<float>& out_confidence) {
     int N_q = query_descs_fp32.rows;
     int N_t = train_descs_fp32.rows;
     if (N_q == 0 || N_t == 0) return {};
@@ -215,20 +203,20 @@ std::vector<cv::DMatch> Tracker::match_l2_fp16(
     for (int i = 0; i < N_t * deep::kXFeatDescDim; ++i)
         t_h16[i] = __float2half(train_descs_fp32.ptr<float>()[i]);
 
-    cudaMemcpy(d_query_descs_, q_h16.data(), N_q*deep::kXFeatDescDim*sizeof(__half), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_train_descs_, t_h16.data(), N_t*deep::kXFeatDescDim*sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_query_descs_, q_h16.data(), N_q * deep::kXFeatDescDim * sizeof(__half),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_train_descs_, t_h16.data(), N_t * deep::kXFeatDescDim * sizeof(__half),
+               cudaMemcpyHostToDevice);
 
-    cuda_match_l2_fp16(d_query_descs_, d_train_descs_,
-                       N_q, N_t, deep::kXFeatDescDim,
-                       cfg_.l2_ratio,
+    cuda_match_l2_fp16(d_query_descs_, d_train_descs_, N_q, N_t, deep::kXFeatDescDim, cfg_.l2_ratio,
                        d_best_idx_, d_best_dist_, d_pseudo_conf_,
                        /*stream=*/0);
     cudaDeviceSynchronize();
 
-    std::vector<int>   best_idx(N_q);
+    std::vector<int> best_idx(N_q);
     std::vector<float> best_conf(N_q);
-    cudaMemcpy(best_idx.data(),  d_best_idx_,    N_q*sizeof(int),   cudaMemcpyDeviceToHost);
-    cudaMemcpy(best_conf.data(), d_pseudo_conf_, N_q*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(best_idx.data(), d_best_idx_, N_q * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(best_conf.data(), d_pseudo_conf_, N_q * sizeof(float), cudaMemcpyDeviceToHost);
 
     out_confidence.resize(N_q, 0.1f);
     std::vector<cv::DMatch> matches;
@@ -240,165 +228,40 @@ std::vector<cv::DMatch> Tracker::match_l2_fp16(
     return matches;
 }
 
-// --- LighterGlue reloc job submission (non-blocking) ---
+// main tracking entry point
 
-bool Tracker::submit_reloc_job(Frame::Ptr frame)
-{
-    if (!lighter_glue_ || !lighter_glue_->is_idle()) return false;
-    if (frame->xfeat_descriptors.empty()) return false;
-
-    // ask TTT for best loop-closure candidate
-    std::vector<std::vector<float>> query_descs_fp32;
-    for (int i = 0; i < frame->xfeat_descriptors.rows; ++i) {
-        const float* row = frame->xfeat_descriptors.ptr<float>(i);
-        query_descs_fp32.emplace_back(row, row + deep::kXFeatDescDim);
-    }
-    auto candidates = ttt_ ? ttt_->query_loop_candidates(query_descs_fp32, 1)
-                           : std::vector<long>{};
-
-    long cand_kf_id = -1;
-    Frame::Ptr cand_kf;
-    if (!candidates.empty()) {
-        cand_kf_id = candidates[0];
-        cand_kf    = map_->get_keyframe(cand_kf_id);
-    }
-    if (!cand_kf || cand_kf->xfeat_descriptors.empty()) {
-        // no TTT candidate — fall back to most recent KF in window
-        auto all_kfs = map_->local_window(5);
-        if (all_kfs.empty()) return false;
-        cand_kf    = all_kfs.back();
-        cand_kf_id = cand_kf->id;
-    }
-
-    deep::RelocJob job;
-    static long job_counter = 0;
-    job.job_id          = ++job_counter;
-    job.query_frame_id  = frame->id;
-    job.candidate_kf_id = cand_kf_id;
-
-    int N_q = frame->xfeat_descriptors.rows;
-    job.query_descs.resize(N_q * deep::kXFeatDescDim);
-    for (int i = 0; i < N_q * deep::kXFeatDescDim; ++i)
-        job.query_descs[i] = __float2half(frame->xfeat_descriptors.ptr<float>()[i]);
-    for (int i = 0; i < N_q; ++i) {
-        job.query_kp_x.push_back(frame->keypoints[i].pt.x);
-        job.query_kp_y.push_back(frame->keypoints[i].pt.y);
-    }
-
-    int N_t = cand_kf->xfeat_descriptors.rows;
-    job.candidate_descs.resize(N_t * deep::kXFeatDescDim);
-    for (int i = 0; i < N_t * deep::kXFeatDescDim; ++i)
-        job.candidate_descs[i] = __float2half(cand_kf->xfeat_descriptors.ptr<float>()[i]);
-    for (int i = 0; i < N_t; ++i) {
-        job.candidate_kp_x.push_back(cand_kf->keypoints[i].pt.x);
-        job.candidate_kp_y.push_back(cand_kf->keypoints[i].pt.y);
-    }
-
-    return lighter_glue_->submit_job(std::move(job));
-}
-
-// --- apply LG reloc result (PnP against matched KF map pts) ---
-
-bool Tracker::apply_reloc_result(Frame::Ptr frame, const deep::RelocResult& result)
-{
-    Frame::Ptr cand_kf = map_->get_keyframe(result.candidate_kf_id);
-    if (!cand_kf) return false;
-
-    // build 3D-2D correspondences from LG match list
-    std::vector<cv::Point3f> pts3d;
-    std::vector<cv::Point2f> pts2d;
-    std::vector<float>       confs;
-    std::vector<int>         query_idxs;
-
-    for (const auto& m : result.matches) {
-        if (m.query_idx >= (int)frame->keypoints.size()) continue;
-        if (m.train_idx >= (int)cand_kf->keypoints.size()) continue;
-        auto& mp = cand_kf->map_points[m.train_idx];
-        if (!mp || mp->is_bad) continue;
-
-        auto& pos = mp->position;
-        pts3d.push_back({(float)pos.x(), (float)pos.y(), (float)pos.z()});
-        pts2d.push_back(frame->keypoints[m.query_idx].pt);
-        confs.push_back(m.confidence);
-        query_idxs.push_back(m.query_idx);
-    }
-
-    if ((int)pts3d.size() < cfg_.pnp_min_inliers * 2) return false;
-
-    cv::Mat rvec, tvec, inlier_mask;
-    int lg_pnp = ((int)pts3d.size() < 30) ? cv::SOLVEPNP_EPNP : cv::SOLVEPNP_SQPNP;
-    bool ok = cv::solvePnPRansac(
-        pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(),
-        rvec, tvec, /*useExtrinsicGuess=*/false,
-        cfg_.pnp_iterations, cfg_.pnp_reprojection,
-        0.99, inlier_mask, lg_pnp);
-
-    if (!ok) return false;
-
-    int n_inliers = cv::countNonZero(inlier_mask);
-    if (n_inliers < cfg_.pnp_min_inliers) return false;
-
-    cv::Mat R_mat; cv::Rodrigues(rvec, R_mat);
-    Eigen::Matrix3d R; Eigen::Vector3d t;
-    for (int i = 0; i < 3; ++i) {
-        t(i) = tvec.at<double>(i);
-        for (int j = 0; j < 3; ++j)
-            R(i, j) = R_mat.at<double>(i, j);
-    }
-    frame->T_cw.linear()      = R;
-    frame->T_cw.translation() = t;
-
-    // propagate LG confidence into match_confidence for BA weighting
-    for (int k = 0; k < (int)inlier_mask.rows; ++k) {
-        if (!inlier_mask.at<uint8_t>(k)) continue;
-        int qi = query_idxs[k];
-        auto& mp = cand_kf->map_points[
-            result.matches[k].train_idx];  // re-index from original match list
-        if (mp && !mp->is_bad) {
-            frame->map_points[qi]       = mp;
-            frame->match_confidence[qi] = result.matches[k].confidence;
-        }
-    }
-
-    std::cout << "[Tracker] LG Relocalized: " << n_inliers << "/" << pts3d.size() << " inliers\n";
-    return true;
-}
-
-// --- main tracking entry point ---
-
-bool Tracker::track(Frame::Ptr frame)
-{
-    // --- feature extraction ---
+bool Tracker::track(Frame::Ptr frame) {
+    // feature extraction
     if (hybrid_mode_) {
         extract_features_hybrid(frame);
         // ORB descs stay 0-row; any path still using match_descriptors() checks keypoints.size()
         frame->descriptors = cv::Mat(0, 32, CV_8U);
     } else {
         // legacy ORB path
-        orb_->detectAndCompute(frame->image_gray, cv::noArray(),
-                               frame->keypoints, frame->descriptors);
+        orb_->detectAndCompute(frame->image_gray, cv::noArray(), frame->keypoints,
+                               frame->descriptors);
         // sub-px refinement — helps stereo depth & reprojection accuracy
         if (!frame->keypoints.empty()) {
             std::vector<cv::Point2f> corners(frame->keypoints.size());
             for (size_t k = 0; k < frame->keypoints.size(); ++k)
                 corners[k] = frame->keypoints[k].pt;
-            cv::cornerSubPix(frame->image_gray, corners,
-                             cv::Size(5, 5), cv::Size(-1, -1),
-                             cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 20, 0.01));
+            cv::cornerSubPix(
+                frame->image_gray, corners, cv::Size(5, 5), cv::Size(-1, -1),
+                cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 20, 0.01));
             for (size_t k = 0; k < frame->keypoints.size(); ++k)
                 frame->keypoints[k].pt = corners[k];
         }
         frame->map_points.resize(frame->keypoints.size(), nullptr);
         if (!frame->image_right.empty()) {
-            orb_->detectAndCompute(frame->image_right, cv::noArray(),
-                                   frame->keypoints_right, frame->descriptors_right);
+            orb_->detectAndCompute(frame->image_right, cv::noArray(), frame->keypoints_right,
+                                   frame->descriptors_right);
             if (!frame->keypoints_right.empty()) {
                 std::vector<cv::Point2f> corners_r(frame->keypoints_right.size());
                 for (size_t k = 0; k < frame->keypoints_right.size(); ++k)
                     corners_r[k] = frame->keypoints_right[k].pt;
-                cv::cornerSubPix(frame->image_right, corners_r,
-                                 cv::Size(5, 5), cv::Size(-1, -1),
-                                 cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 20, 0.01));
+                cv::cornerSubPix(
+                    frame->image_right, corners_r, cv::Size(5, 5), cv::Size(-1, -1),
+                    cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 20, 0.01));
                 for (size_t k = 0; k < frame->keypoints_right.size(); ++k)
                     frame->keypoints_right[k].pt = corners_r[k];
             }
@@ -407,93 +270,35 @@ bool Tracker::track(Frame::Ptr frame)
         }
     }
 
-    // --- RELOCALIZING: poll LG for async result each frame ---
-    if (state_ == TrackingState::RELOCALIZING) {
-        ++reloc_wait_frames_;
-
-        // dead-reckon while LG is running on its thread
-        frame->T_cw = velocity_valid_
-            ? velocity_ * last_frame_->T_cw
-            : last_frame_->T_cw;
-
-        if (lighter_glue_) {
-            auto result = lighter_glue_->try_get_result();
-            if (result.has_value()) {
-                if (result->success && apply_reloc_result(frame, *result)) {
-                    std::cout << "[Tracker] LG Relocalized — resuming\n";
-                    velocity_valid_   = false;
-
-                    reloc_wait_frames_ = 0;
-                    state_            = TrackingState::OK;
-                    last_frame_       = frame;
-                    return true;
-                } else {
-                    // LG returned but still failed — give up, reset
-                    std::cerr << "[Tracker] LG reloc failed, resetting\n";
-                    goto reset_and_reinit;
-                }
-            }
-        }
-        if (reloc_wait_frames_ >= cfg_.reloc_timeout) {
-            std::cerr << "[Tracker] LG reloc timeout, resetting\n";
-            goto reset_and_reinit;
-        }
-        last_frame_ = frame;
-        return false;
-    }
-
-    // --- LOST: submit LG job or fall back to legacy sync relocalize ---
+    // LOST: attempt synchronous relocalize, then reset
     if (state_ == TrackingState::LOST) {
-        if (hybrid_mode_ && lighter_glue_) {
-            bool submitted = submit_reloc_job(frame);
-            if (submitted) {
-                state_ = TrackingState::RELOCALIZING;
-                reloc_wait_frames_ = 0;
-                // coast this frame while LG spins up
-                frame->T_cw = velocity_valid_
-                    ? velocity_ * last_frame_->T_cw : last_frame_->T_cw;
-                last_frame_ = frame;
-                return false;
-            }
-            // LG busy — coast one more frame
-            frame->T_cw = velocity_valid_
-                ? velocity_ * last_frame_->T_cw : last_frame_->T_cw;
-            last_frame_ = frame;
-            return false;
-        }
-
-        // legacy synchronous relocalize (ORB mode only)
         if (try_relocalize(frame)) {
             std::cout << "[Tracker] Relocalized successfully\n";
             velocity_valid_ = false;
-            state_          = TrackingState::OK;
-            last_frame_     = frame;
+            state_ = TrackingState::OK;
+            last_frame_ = frame;
             return true;
         }
 
-        reset_and_reinit:
         std::cerr << "[Tracker] LOST — resetting map + re-initializing\n";
         frame->T_cw = velocity_valid_ ? (velocity_ * last_frame_->T_cw) : last_frame_->T_cw;
         map_->reset();
-        last_keyframe_       = nullptr;
+        last_keyframe_ = nullptr;
         last_kf_pnp_tracked_ = 0;
-        velocity_valid_      = false;
-        reloc_wait_frames_   = 0;
-        last_frame_          = frame;
-        state_               = TrackingState::NOT_INITIALIZED;
+        velocity_valid_ = false;
+        last_frame_ = frame;
+        state_ = TrackingState::NOT_INITIALIZED;
         return false;
     }
 
-    if (state_ == TrackingState::NOT_INITIALIZED)
-        return initialize(frame);
+    if (state_ == TrackingState::NOT_INITIALIZED) return initialize(frame);
 
-    // --- OK / COASTING: normal tracking ---
+    // OK / COASTING: normal tracking
     bool ok = track_with_motion_model(frame);
     if (ok) ok = track_local_map(frame);
     if (ok) {
         lost_streak_ = 0;
-        if (state_ == TrackingState::COASTING)
-            state_ = TrackingState::OK;
+        if (state_ == TrackingState::COASTING) state_ = TrackingState::OK;
     } else {
         ++lost_streak_;
         if (lost_streak_ < cfg_.coast_limit) {
@@ -505,17 +310,14 @@ bool Tracker::track(Frame::Ptr frame)
             if (velocity_valid_) {
                 constexpr double decay = 0.8;
                 Eigen::AngleAxisd aa(velocity_.rotation());
-                Eigen::Matrix3d R_decayed = Eigen::AngleAxisd(
-                    aa.angle() * decay, aa.axis()).toRotationMatrix();
+                Eigen::Matrix3d R_decayed =
+                    Eigen::AngleAxisd(aa.angle() * decay, aa.axis()).toRotationMatrix();
                 Eigen::Vector3d t_decayed = velocity_.translation() * decay;
                 velocity_ = Eigen::Isometry3d::Identity();
                 velocity_.linear() = R_decayed;
                 velocity_.translation() = t_decayed;
             }
 
-            // kick off LG reloc early so it has a head start if we go LOST next frame
-            if (hybrid_mode_ && lighter_glue_ && lost_streak_ == 1)
-                submit_reloc_job(frame);
             last_frame_ = frame;
             // return true if velocity valid — pose is still usable, don't penalize in metrics
             // no KF inserted, no velocity update, map quality preserved
@@ -528,10 +330,9 @@ bool Tracker::track(Frame::Ptr frame)
     return ok;
 }
 
-// --- init ---
+// init
 
-bool Tracker::initialize(Frame::Ptr frame)
-{
+bool Tracker::initialize(Frame::Ptr frame) {
     if (cam_.is_stereo() && !frame->uR.empty()) {
         // propagate last pose so reinit doesn't snap back to origin
         if (last_frame_) {
@@ -545,8 +346,8 @@ bool Tracker::initialize(Frame::Ptr frame)
         }
         insert_keyframe(frame);
         velocity_valid_ = false;  // no velocity until second tracked frame
-        state_          = TrackingState::OK;
-        last_frame_     = frame;
+        state_ = TrackingState::OK;
+        last_frame_ = frame;
         std::cout << "[Tracker] Stereo initialized: " << n_pts << " metric map points\n";
         return true;
     }
@@ -557,10 +358,9 @@ bool Tracker::initialize(Frame::Ptr frame)
     return false;
 }
 
-// --- constant-velocity tracking: matches pool pts, runs PnP ---
+// constant-velocity tracking: matches pool pts, runs PnP
 
-bool Tracker::track_with_motion_model(Frame::Ptr frame)
-{
+bool Tracker::track_with_motion_model(Frame::Ptr frame) {
     // predict pose w/ constant-velocity model
     if (velocity_valid_) {
         frame->T_cw = velocity_ * last_frame_->T_cw;
@@ -570,9 +370,9 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
 
     // build descriptor pool from co-vis KFs; top-20 by covis count
     // fall back to recent window if covis graph is sparse (early in seq)
-    cv::Mat                    pool_desc;
+    cv::Mat pool_desc;
     std::vector<MapPoint::Ptr> pool_mps;
-    std::vector<Frame::Ptr>    pool_kfs;  // kept for post-PnP project-and-search
+    std::vector<Frame::Ptr> pool_kfs;  // kept for post-PnP project-and-search
     {
         if (last_keyframe_) {
             auto covis = map_->get_covisible_keyframes(last_keyframe_->id, 20);
@@ -612,8 +412,9 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         if ((int)pool_mps.size() > kPoolCap) {
             std::vector<int> idx(pool_mps.size());
             std::iota(idx.begin(), idx.end(), 0);
-            std::partial_sort(idx.begin(), idx.begin() + kPoolCap, idx.end(),
-                [&](int a, int b){ return pool_mps[a]->observed_times > pool_mps[b]->observed_times; });
+            std::partial_sort(idx.begin(), idx.begin() + kPoolCap, idx.end(), [&](int a, int b) {
+                return pool_mps[a]->observed_times > pool_mps[b]->observed_times;
+            });
             idx.resize(kPoolCap);
             std::vector<MapPoint::Ptr> capped_mps;
             cv::Mat capped_desc;
@@ -622,7 +423,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                 capped_mps.push_back(pool_mps[i]);
                 capped_desc.push_back(pool_desc.row(i));
             }
-            pool_mps  = std::move(capped_mps);
+            pool_mps = std::move(capped_mps);
             pool_desc = capped_desc;
         }
     }
@@ -634,27 +435,26 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
 
     // phase 1: spatial search around projected pool pts
     // phase 2: GPU L2/Hamming fallback if phase 1 gives too few matches
-    std::vector<cv::Point3f>   pts3d;
-    std::vector<cv::Point2f>   pts2d;
-    std::vector<int>           match_idxs;
+    std::vector<cv::Point3f> pts3d;
+    std::vector<cv::Point2f> pts2d;
+    std::vector<int> match_idxs;
     std::vector<MapPoint::Ptr> match_mps;
-    std::unordered_set<int>    used_kp;
+    std::unordered_set<int> used_kp;
 
     // phase 1: projection-based spatial matching
     {
-        const int   cell     = 16;
-        const int   frame_w  = frame->image_gray.cols;
-        const int   frame_h  = frame->image_gray.rows;
-        const int   n_cols_g = (frame_w + cell - 1) / cell;
-        const int   n_rows_g = (frame_h + cell - 1) / cell;
+        const int cell = 16;
+        const int frame_w = frame->image_gray.cols;
+        const int frame_h = frame->image_gray.rows;
+        const int n_cols_g = (frame_w + cell - 1) / cell;
+        const int n_rows_g = (frame_h + cell - 1) / cell;
         // widen search at turns; 70px when velocity invalid (one frame after BA)
-        const double pred_ang = velocity_valid_
-            ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
+        const double pred_ang =
+            velocity_valid_ ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
         const float base_r = velocity_valid_ ? 40.0f : 70.0f;
-        const float search_r = (pred_ang > 0.03)
-            ? std::min(150.0f, base_r + float(pred_ang / 0.03) * 20.0f)
-            : base_r;
-        const int   max_ham  = cfg_.hamming_threshold;
+        const float search_r =
+            (pred_ang > 0.03) ? std::min(150.0f, base_r + float(pred_ang / 0.03) * 20.0f) : base_r;
+        const int max_ham = cfg_.hamming_threshold;
 
         // spatial grid: cell -> kp indices for fast nn candidate lookup
         std::vector<std::vector<int>> kp_grid(n_cols_g * n_rows_g);
@@ -674,16 +474,16 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
 
             mp->visible_times++;  // point projects into frustum
 
-            int cx0 = std::max(0,            (int)((u - search_r) / cell));
+            int cx0 = std::max(0, (int)((u - search_r) / cell));
             int cx1 = std::min(n_cols_g - 1, (int)((u + search_r) / cell));
-            int cy0 = std::max(0,            (int)((v - search_r) / cell));
+            int cy0 = std::max(0, (int)((v - search_r) / cell));
             int cy1 = std::min(n_rows_g - 1, (int)((v + search_r) / cell));
 
-            int   best_j   = -1,  second_j = -1;
-            float best_d   = hybrid_mode_ ? 0.6f : float(max_ham + 1);
+            int best_j = -1, second_j = -1;
+            float best_d = hybrid_mode_ ? 0.6f : float(max_ham + 1);
             float second_d = best_d;
-            const cv::Mat& frame_descs = hybrid_mode_ ? frame->xfeat_descriptors
-                                                       : frame->descriptors;
+            const cv::Mat& frame_descs =
+                hybrid_mode_ ? frame->xfeat_descriptors : frame->descriptors;
             for (int gy = cy0; gy <= cy1; ++gy)
                 for (int gx = cx0; gx <= cx1; ++gx)
                     for (int kp_j : kp_grid[gy * n_cols_g + gx]) {
@@ -692,24 +492,26 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                         float d;
                         if (hybrid_mode_) {
                             // L2 distance (XFeat is L2-normalized, range [0,2])
-                            d = (float)cv::norm(pool_desc.row(mi),
-                                                frame_descs.row(kp_j),
+                            d = (float)cv::norm(pool_desc.row(mi), frame_descs.row(kp_j),
                                                 cv::NORM_L2);
                         } else {
-                            d = (float)cv::norm(pool_desc.row(mi),
-                                                frame_descs.row(kp_j),
+                            d = (float)cv::norm(pool_desc.row(mi), frame_descs.row(kp_j),
                                                 cv::NORM_HAMMING);
                         }
                         if (d < best_d) {
-                            second_d = best_d; second_j = best_j;
-                            best_d = d; best_j = kp_j;
+                            second_d = best_d;
+                            second_j = best_j;
+                            best_d = d;
+                            best_j = kp_j;
                         } else if (d < second_d) {
-                            second_d = d; second_j = kp_j;
+                            second_d = d;
+                            second_j = kp_j;
                         }
                     }
 
             if (best_j < 0) continue;
-            if (hybrid_mode_ && second_j >= 0 && best_d > 0.75f * second_d) continue;  // Lowe ratio for hybrid
+            if (hybrid_mode_ && second_j >= 0 && best_d > 0.75f * second_d)
+                continue;  // Lowe ratio for hybrid
             if (!used_kp.insert(best_j).second) continue;
             auto& p = mp->position;
             // propagate ratio-test confidence into BA weighting
@@ -721,13 +523,17 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
             match_idxs.push_back(best_j);
             match_mps.push_back(mp);
         }
-        fprintf(stderr, "[Tracker] Proj-match: %d/%d pts\n",
-                (int)pts3d.size(), (int)pool_mps.size());
+        fprintf(stderr, "[Tracker] Proj-match: %d/%d pts\n", (int)pts3d.size(),
+                (int)pool_mps.size());
     }
 
     // phase 2: fallback — L2 for hybrid, GPU Hamming for ORB
     if ((int)pts3d.size() < cfg_.pnp_min_inliers) {
-        pts3d.clear(); pts2d.clear(); match_idxs.clear(); match_mps.clear(); used_kp.clear();
+        pts3d.clear();
+        pts2d.clear();
+        match_idxs.clear();
+        match_mps.clear();
+        used_kp.clear();
         std::vector<cv::DMatch> raw_matches;
         if (hybrid_mode_) {
             std::vector<float> dummy_conf;
@@ -738,7 +544,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         for (auto& m : raw_matches) {
             if (!used_kp.insert(m.trainIdx).second) continue;
             auto& mp = pool_mps[m.queryIdx];
-            auto& p  = mp->position;
+            auto& p = mp->position;
             pts3d.push_back({(float)p.x(), (float)p.y(), (float)p.z()});
             pts2d.push_back(frame->keypoints[m.trainIdx].pt);
             match_idxs.push_back(m.trainIdx);
@@ -754,8 +560,8 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
     // PnP RANSAC w/ velocity-predicted pose as initial guess
     cv::Mat rvec(3, 1, CV_64F), tvec(3, 1, CV_64F), inlier_mask;
     {
-        Eigen::AngleAxisd   aa(frame->T_cw.rotation());
-        Eigen::Vector3d     ax = aa.angle() * aa.axis();
+        Eigen::AngleAxisd aa(frame->T_cw.rotation());
+        Eigen::Vector3d ax = aa.angle() * aa.axis();
         rvec.at<double>(0) = ax.x();
         rvec.at<double>(1) = ax.y();
         rvec.at<double>(2) = ax.z();
@@ -763,17 +569,15 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         tvec.at<double>(1) = frame->T_cw.translation().y();
         tvec.at<double>(2) = frame->T_cw.translation().z();
     }
-    const double pred_angle = velocity_valid_
-        ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
+    const double pred_angle =
+        velocity_valid_ ? Eigen::AngleAxisd(velocity_.rotation()).angle() : 0.0;
     const bool use_guess = velocity_valid_ && (pred_angle < 0.5);
 
     // EPNP for small sets — SQPNP can crash on degenerate configs w/ <30 pts
     int pnp_method = ((int)pts3d.size() < 30) ? cv::SOLVEPNP_EPNP : cv::SOLVEPNP_SQPNP;
-    bool ok = cv::solvePnPRansac(
-        pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(),
-        rvec, tvec, /*useExtrinsicGuess=*/use_guess,
-        cfg_.pnp_iterations, cfg_.pnp_reprojection, 0.99,
-        inlier_mask, pnp_method);
+    bool ok = cv::solvePnPRansac(pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(), rvec, tvec,
+                                 /*useExtrinsicGuess=*/use_guess, cfg_.pnp_iterations,
+                                 cfg_.pnp_reprojection, 0.99, inlier_mask, pnp_method);
     if (!ok) {
         std::cerr << "[Tracker] Track: solvePnPRansac failed (" << pts3d.size() << " corr)\n";
         return false;
@@ -784,12 +588,18 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
     int n_inliers = 0;
     if (inlier_mask.type() == CV_8U) {
         for (int k = 0; k < inlier_mask.rows && k < (int)pts3d.size(); ++k)
-            if (inlier_mask.at<uint8_t>(k)) { is_inlier[k] = true; ++n_inliers; }
+            if (inlier_mask.at<uint8_t>(k)) {
+                is_inlier[k] = true;
+                ++n_inliers;
+            }
     } else {
         // index mode (CV_32S): each element is an inlier index
         for (int k = 0; k < inlier_mask.rows; ++k) {
             int idx = inlier_mask.at<int>(k);
-            if (idx >= 0 && idx < (int)pts3d.size()) { is_inlier[idx] = true; ++n_inliers; }
+            if (idx >= 0 && idx < (int)pts3d.size()) {
+                is_inlier[idx] = true;
+                ++n_inliers;
+            }
         }
     }
     if (n_inliers < cfg_.pnp_min_inliers) {
@@ -801,22 +611,22 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
     std::vector<cv::Point3f> in3d;
     std::vector<cv::Point2f> in2d;
     for (int i = 0; i < (int)pts3d.size(); ++i)
-        if (is_inlier[i]) { in3d.push_back(pts3d[i]); in2d.push_back(pts2d[i]); }
-    cv::solvePnP(in3d, in2d, cam_.K_cv(), cam_.dist_cv(),
-                 rvec, tvec, /*useExtrinsicGuess=*/true, cv::SOLVEPNP_ITERATIVE);
+        if (is_inlier[i]) {
+            in3d.push_back(pts3d[i]);
+            in2d.push_back(pts2d[i]);
+        }
+    cv::solvePnP(in3d, in2d, cam_.K_cv(), cam_.dist_cv(), rvec, tvec, /*useExtrinsicGuess=*/true,
+                 cv::SOLVEPNP_ITERATIVE);
 
     cv::Mat R_cv;
     cv::Rodrigues(rvec, R_cv);
     Eigen::Isometry3d T_cw_candidate = Eigen::Isometry3d::Identity();
     for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++)
-            T_cw_candidate.linear()(r, c) = R_cv.at<double>(r, c);
-    T_cw_candidate.translation() << tvec.at<double>(0),
-                                     tvec.at<double>(1),
-                                     tvec.at<double>(2);
+        for (int c = 0; c < 3; c++) T_cw_candidate.linear()(r, c) = R_cv.at<double>(r, c);
+    T_cw_candidate.translation() << tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2);
 
-    fprintf(stderr, "[Tracker] PnP inliers: %d / %d correspondences\n",
-            n_inliers, (int)pts3d.size());
+    fprintf(stderr, "[Tracker] PnP inliers: %d / %d correspondences\n", n_inliers,
+            (int)pts3d.size());
 
     // sanity check: reject physically impossible per-frame motion
     // 0.3 rad ≈ 17°; 3.0 m ≈ 108 km/h at 10Hz — anything beyond this is a bad solve
@@ -826,13 +636,11 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         double delta_trans = delta.translation().norm();
 
         if (delta_angle > 0.3) {
-            fprintf(stderr, "[Tracker] PnP rejected: delta rot %.1f deg\n",
-                    delta_angle * 57.2958);
+            fprintf(stderr, "[Tracker] PnP rejected: delta rot %.1f deg\n", delta_angle * 57.2958);
             return false;
         }
         if (delta_trans > 3.0) {
-            fprintf(stderr, "[Tracker] PnP rejected: delta trans %.1f m\n",
-                    delta_trans);
+            fprintf(stderr, "[Tracker] PnP rejected: delta trans %.1f m\n", delta_trans);
             return false;
         }
     }
@@ -841,14 +649,16 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
     {
         Eigen::Matrix3d R_wc_pred = frame->T_cw.inverse().rotation();
         Eigen::Matrix3d R_wc_commit = T_cw_candidate.inverse().rotation();
-        double yaw_pred   = std::atan2(R_wc_pred(0, 2), R_wc_pred(0, 0)) * 180.0 / 3.14159265358979323846;
-        double yaw_commit = std::atan2(R_wc_commit(0, 2), R_wc_commit(0, 0)) * 180.0 / 3.14159265358979323846;
+        double yaw_pred =
+            std::atan2(R_wc_pred(0, 2), R_wc_pred(0, 0)) * 180.0 / 3.14159265358979323846;
+        double yaw_commit =
+            std::atan2(R_wc_commit(0, 2), R_wc_commit(0, 0)) * 180.0 / 3.14159265358979323846;
         double vel_err = yaw_commit - yaw_pred;
-        while (vel_err >  180.0) vel_err -= 360.0;
+        while (vel_err > 180.0) vel_err -= 360.0;
         while (vel_err < -180.0) vel_err += 360.0;
         if (std::abs(vel_err) > 0.05)
-            fprintf(stderr, "[VEL-DIAG] pred_yaw=%.2f commit_yaw=%.2f err=%.2f deg\n",
-                    yaw_pred, yaw_commit, vel_err);
+            fprintf(stderr, "[VEL-DIAG] pred_yaw=%.2f commit_yaw=%.2f err=%.2f deg\n", yaw_pred,
+                    yaw_commit, vel_err);
     }
 
     frame->T_cw = T_cw_candidate;  // commit pose
@@ -862,13 +672,13 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
 
     // post-PnP project-and-search: pull in more map pts w/o a second RANSAC pass
     {
-        const int   cell      = 16;
-        const int   frame_w   = frame->image_gray.cols;
-        const int   frame_h   = frame->image_gray.rows;
-        const int   n_cols_g  = (frame_w + cell - 1) / cell;
-        const int   n_rows_g  = (frame_h + cell - 1) / cell;
-        const float search_r  = 15.0f;
-        const int   max_ham   = 50;
+        const int cell = 16;
+        const int frame_w = frame->image_gray.cols;
+        const int frame_h = frame->image_gray.rows;
+        const int n_cols_g = (frame_w + cell - 1) / cell;
+        const int n_rows_g = (frame_h + cell - 1) / cell;
+        const float search_r = 15.0f;
+        const int max_ham = 50;
         const float max_repr2 = 25.0f;  // 5px reprojection threshold²
 
         // grid of kps that still need a map point
@@ -885,15 +695,15 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
         for (auto& mp : pool_mps) proj_seen.insert(mp->id);  // skip pts already tried in phase 1
 
         for (auto& kf : pool_kfs) {
-            const bool kf_has_desc = hybrid_mode_ ? !kf->xfeat_descriptors.empty()
-                                                   : !kf->descriptors.empty();
+            const bool kf_has_desc =
+                hybrid_mode_ ? !kf->xfeat_descriptors.empty() : !kf->descriptors.empty();
             if (!kf_has_desc) continue;
             for (int i = 0; i < (int)kf->map_points.size(); ++i) {
                 auto& mp = kf->map_points[i];
                 if (!mp || mp->is_bad) continue;
                 if (!proj_seen.insert(mp->id).second) continue;
-                if (hybrid_mode_ ? (i >= kf->xfeat_descriptors.rows)
-                                 : (i >= kf->descriptors.rows)) continue;
+                if (hybrid_mode_ ? (i >= kf->xfeat_descriptors.rows) : (i >= kf->descriptors.rows))
+                    continue;
 
                 // project w/ committed T_cw
                 Eigen::Vector3d Xc = frame->T_cw * mp->position;
@@ -902,9 +712,9 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                 float v = (float)(cam_.fy * Xc.y() / Xc.z() + cam_.cy);
                 if (u < 0 || u >= frame_w || v < 0 || v >= frame_h) continue;
 
-                int cx0 = std::max(0,            (int)((u - search_r) / cell));
+                int cx0 = std::max(0, (int)((u - search_r) / cell));
                 int cx1 = std::min(n_cols_g - 1, (int)((u + search_r) / cell));
-                int cy0 = std::max(0,            (int)((v - search_r) / cell));
+                int cy0 = std::max(0, (int)((v - search_r) / cell));
                 int cy1 = std::min(n_rows_g - 1, (int)((v + search_r) / cell));
 
                 int best_j = -1;
@@ -917,7 +727,10 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                                 float d = (float)cv::norm(kf->xfeat_descriptors.row(i),
                                                           frame->xfeat_descriptors.row(kp_j),
                                                           cv::NORM_L2);
-                                if (d < best_l2) { best_l2 = d; best_j = kp_j; }
+                                if (d < best_l2) {
+                                    best_l2 = d;
+                                    best_j = kp_j;
+                                }
                             }
                 } else {
                     int best_ham = max_ham;
@@ -925,9 +738,11 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                         for (int gx = cx0; gx <= cx1; ++gx)
                             for (int kp_j : kp_grid[gy * n_cols_g + gx]) {
                                 int d = cv::norm(kf->descriptors.row(i),
-                                                frame->descriptors.row(kp_j),
-                                                cv::NORM_HAMMING);
-                                if (d < best_ham) { best_ham = d; best_j = kp_j; }
+                                                 frame->descriptors.row(kp_j), cv::NORM_HAMMING);
+                                if (d < best_ham) {
+                                    best_ham = d;
+                                    best_j = kp_j;
+                                }
                             }
                 }
 
@@ -936,7 +751,7 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
                 // validate w/ reprojection error at committed pose
                 float du = u - frame->keypoints[best_j].pt.x;
                 float dv = v - frame->keypoints[best_j].pt.y;
-                if (du*du + dv*dv > max_repr2) continue;
+                if (du * du + dv * dv > max_repr2) continue;
 
                 used_kp.insert(best_j);
                 frame->map_points[best_j] = mp;
@@ -955,8 +770,8 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
             Eigen::Quaterniond q_old(velocity_.rotation());
             Eigen::Quaterniond q_new(raw_vel.rotation());
             Eigen::Quaterniond q_blend = q_old.slerp(alpha, q_new);
-            Eigen::Vector3d t_blend = (1.0 - alpha) * velocity_.translation()
-                                    + alpha * raw_vel.translation();
+            Eigen::Vector3d t_blend =
+                (1.0 - alpha) * velocity_.translation() + alpha * raw_vel.translation();
             velocity_ = Eigen::Isometry3d::Identity();
             velocity_.linear() = q_blend.toRotationMatrix();
             velocity_.translation() = t_blend;
@@ -968,20 +783,18 @@ bool Tracker::track_with_motion_model(Frame::Ptr frame)
     return true;
 }
 
-// --- local map tracking: insert KF if needed ---
+// local map tracking: insert KF if needed
 
-bool Tracker::track_local_map(Frame::Ptr frame)
-{
+bool Tracker::track_local_map(Frame::Ptr frame) {
     if (need_new_keyframe(frame)) {
         insert_keyframe(frame);
     }
     return frame->num_tracked() >= cfg_.pnp_min_inliers;
 }
 
-// --- KF decision ---
+// KF decision
 
-bool Tracker::need_new_keyframe(Frame::Ptr frame) const
-{
+bool Tracker::need_new_keyframe(Frame::Ptr frame) const {
     if (!last_keyframe_) return true;
 
     int tracked = frame->num_tracked();  // PnP inliers only (pre-triangulation)
@@ -1000,8 +813,7 @@ bool Tracker::need_new_keyframe(Frame::Ptr frame) const
     return false;
 }
 
-double Tracker::compute_median_parallax(Frame::Ptr frame, Frame::Ptr ref_kf) const
-{
+double Tracker::compute_median_parallax(Frame::Ptr frame, Frame::Ptr ref_kf) const {
     if (!ref_kf) return 0.0;
     const Eigen::Vector3d C_ref = ref_kf->camera_center();
     const Eigen::Vector3d C_cur = frame->camera_center();
@@ -1019,10 +831,8 @@ double Tracker::compute_median_parallax(Frame::Ptr frame, Frame::Ptr ref_kf) con
     return angles[angles.size() / 2];
 }
 
-void Tracker::log_anms_grid_stats(const std::vector<cv::KeyPoint>& kps,
-                                  int img_w, int img_h,
-                                  int grid_cols, int grid_rows) const
-{
+void Tracker::log_anms_grid_stats(const std::vector<cv::KeyPoint>& kps, int img_w, int img_h,
+                                  int grid_cols, int grid_rows) const {
     std::vector<int> counts(grid_cols * grid_rows, 0);
     for (const auto& kp : kps) {
         int col = std::min((int)(kp.pt.x / img_w * grid_cols), grid_cols - 1);
@@ -1033,18 +843,17 @@ void Tracker::log_anms_grid_stats(const std::vector<cv::KeyPoint>& kps,
     float var = 0.f;
     for (int c : counts) var += (c - mean) * (c - mean);
     float cv = std::sqrt(var / counts.size()) / (mean + 1e-6f);
-    fprintf(stderr, "[ANMS] %d pts | grid %dx%d | mean/cell=%.1f | CoV=%.2f\n",
-            (int)kps.size(), grid_cols, grid_rows, mean, cv);
+    fprintf(stderr, "[ANMS] %d pts | grid %dx%d | mean/cell=%.1f | CoV=%.2f\n", (int)kps.size(),
+            grid_cols, grid_rows, mean, cv);
     for (int r = 0; r < grid_rows; ++r) {
         int row_total = 0;
         for (int c = 0; c < grid_cols; ++c) row_total += counts[r * grid_cols + c];
-        fprintf(stderr, "  row%d: %d pts (%.0f%%)\n",
-                r, row_total, 100.f * row_total / ((int)kps.size() + 1));
+        fprintf(stderr, "  row%d: %d pts (%.0f%%)\n", r, row_total,
+                100.f * row_total / ((int)kps.size() + 1));
     }
 }
 
-void Tracker::insert_keyframe(Frame::Ptr frame)
-{
+void Tracker::insert_keyframe(Frame::Ptr frame) {
     // log ANMS spatial distribution at every KF — helps diagnose pitch-bias
     if (cam_.width > 0 && !frame->keypoints.empty())
         log_anms_grid_stats(frame->keypoints, cam_.width, cam_.height, 6, 4);
@@ -1058,27 +867,24 @@ void Tracker::insert_keyframe(Frame::Ptr frame)
     for (auto& tri_kf : map_->local_window(3)) {
         if (tri_kf->id == frame->id) continue;
         std::vector<cv::DMatch> kf_matches;
-        if (hybrid_mode_ && !frame->xfeat_descriptors.empty()
-                         && !tri_kf->xfeat_descriptors.empty()) {
+        if (hybrid_mode_ && !frame->xfeat_descriptors.empty() &&
+            !tri_kf->xfeat_descriptors.empty()) {
             std::vector<float> dummy_conf;
-            kf_matches = match_l2_fp16(tri_kf->xfeat_descriptors,
-                                       frame->xfeat_descriptors, dummy_conf);
+            kf_matches =
+                match_l2_fp16(tri_kf->xfeat_descriptors, frame->xfeat_descriptors, dummy_conf);
         } else {
-            kf_matches = match_descriptors(tri_kf->descriptors,
-                                           frame->descriptors, /*ratio=*/true);
+            kf_matches = match_descriptors(tri_kf->descriptors, frame->descriptors, /*ratio=*/true);
         }
         std::vector<cv::DMatch> new_matches;
         for (auto& m : kf_matches) {
-            if (m.trainIdx < (int)frame->map_points.size() &&
-                !frame->map_points[m.trainIdx]) {
+            if (m.trainIdx < (int)frame->map_points.size() && !frame->map_points[m.trainIdx]) {
                 new_matches.push_back(m);
             }
         }
         if (!new_matches.empty()) {
             int n_new = triangulate_and_add(tri_kf, frame, new_matches);
             if (n_new > 0)
-                std::cout << "[Tracker] KF " << frame->id
-                          << ": triangulated " << n_new
+                std::cout << "[Tracker] KF " << frame->id << ": triangulated " << n_new
                           << " pts vs KF " << tri_kf->id << "\n";
         }
     }
@@ -1087,8 +893,8 @@ void Tracker::insert_keyframe(Frame::Ptr frame)
     if (cam_.is_stereo() && !frame->uR.empty()) {
         int n_stereo = triangulate_stereo(frame);
         if (n_stereo > 0)
-            std::cout << "[Tracker] KF " << frame->id
-                      << ": stereo added " << n_stereo << " metric pts\n";
+            std::cout << "[Tracker] KF " << frame->id << ": stereo added " << n_stereo
+                      << " metric pts\n";
     }
 
     map_->insert_keyframe(frame);
@@ -1097,7 +903,7 @@ void Tracker::insert_keyframe(Frame::Ptr frame)
     // push XFeat descs to TTT loop detector (non-blocking background thread)
     if (hybrid_mode_ && ttt_ && !frame->xfeat_descriptors.empty()) {
         deep::TTTUpdateJob ttt_job;
-        ttt_job.kf_id       = frame->id;
+        ttt_job.kf_id = frame->id;
         ttt_job.kf_position = frame->camera_center();
         for (int i = 0; i < frame->xfeat_descriptors.rows; ++i) {
             const float* row = frame->xfeat_descriptors.ptr<float>(i);
@@ -1107,13 +913,10 @@ void Tracker::insert_keyframe(Frame::Ptr frame)
     }
 }
 
-// --- GPU descriptor matching (ORB / Hamming) ---
+// GPU descriptor matching (ORB / Hamming)
 
-std::vector<cv::DMatch> Tracker::match_descriptors(
-    const cv::Mat& query_desc,
-    const cv::Mat& train_desc,
-    bool use_ratio)
-{
+std::vector<cv::DMatch> Tracker::match_descriptors(const cv::Mat& query_desc,
+                                                   const cv::Mat& train_desc, bool use_ratio) {
     int N_q = query_desc.rows;
     int N_t = train_desc.rows;
 
@@ -1121,19 +924,16 @@ std::vector<cv::DMatch> Tracker::match_descriptors(
 
     // CUDA kernel needs contiguous CV_8U data
     cv::Mat q = query_desc.isContinuous() ? query_desc : query_desc.clone();
-    cv::Mat t = train_desc.isContinuous()  ? train_desc  : train_desc.clone();
+    cv::Mat t = train_desc.isContinuous() ? train_desc : train_desc.clone();
 
     std::vector<int> best_idx(N_q, -1);
     std::vector<int> best_dist(N_q, kMaxHamming);
 
     if (use_ratio) {
-        cuda_match_hamming_ratio(
-            q.data, t.data, N_q, N_t, cfg_.lowe_ratio,
-            best_idx.data(), best_dist.data());
+        cuda_match_hamming_ratio(q.data, t.data, N_q, N_t, cfg_.lowe_ratio, best_idx.data(),
+                                 best_dist.data());
     } else {
-        cuda_match_hamming(
-            q.data, t.data, N_q, N_t,
-            best_idx.data(), best_dist.data());
+        cuda_match_hamming(q.data, t.data, N_q, N_t, best_idx.data(), best_dist.data());
     }
 
     std::vector<cv::DMatch> matches;
@@ -1146,21 +946,19 @@ std::vector<cv::DMatch> Tracker::match_descriptors(
     return matches;
 }
 
-// --- triangulation ---
+// triangulation
 
 int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
-                                  const std::vector<cv::DMatch>& matches)
-{
+                                 const std::vector<cv::DMatch>& matches) {
     // build 3x4 projection matrices
     auto make_proj = [&](const Eigen::Isometry3d& T_cw) -> cv::Mat {
         cv::Mat P(3, 4, CV_64F);
         Eigen::Matrix<double, 3, 4> Rt;
-        Rt.block<3,3>(0,0) = T_cw.rotation();
-        Rt.block<3,1>(0,3) = T_cw.translation();
+        Rt.block<3, 3>(0, 0) = T_cw.rotation();
+        Rt.block<3, 1>(0, 3) = T_cw.translation();
         Eigen::Matrix<double, 3, 4> KRt = cam_.K() * Rt;
         for (int r = 0; r < 3; r++)
-            for (int c = 0; c < 4; c++)
-                P.at<double>(r, c) = KRt(r, c);
+            for (int c = 0; c < 4; c++) P.at<double>(r, c) = KRt(r, c);
         return P;
     };
 
@@ -1168,7 +966,7 @@ int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
     cv::Mat P1 = make_proj(cur->T_cw);
 
     std::vector<cv::Point2f> pts0, pts1;
-    std::vector<int>         ref_kp_idxs, cur_kp_idxs;
+    std::vector<int> ref_kp_idxs, cur_kp_idxs;
     for (auto& m : matches) {
         pts0.push_back(ref->keypoints[m.queryIdx].pt);
         pts1.push_back(cur->keypoints[m.trainIdx].pt);
@@ -1184,8 +982,7 @@ int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
         float w = pts4d.at<float>(3, i);  // triangulatePoints outputs CV_32F
         if (std::abs(w) < 1e-6f) continue;
 
-        Eigen::Vector3d Xw(pts4d.at<float>(0, i) / w,
-                           pts4d.at<float>(1, i) / w,
+        Eigen::Vector3d Xw(pts4d.at<float>(0, i) / w, pts4d.at<float>(1, i) / w,
                            pts4d.at<float>(2, i) / w);
 
         // depth check in both cameras
@@ -1217,12 +1014,11 @@ int Tracker::triangulate_and_add(Frame::Ptr ref, Frame::Ptr cur,
     return n_added;
 }
 
-// --- relocalization: match against all KFs w/ stricter inlier threshold ---
+// relocalization: match against all KFs w/ stricter inlier threshold
 
-bool Tracker::try_relocalize(Frame::Ptr frame)
-{
+bool Tracker::try_relocalize(Frame::Ptr frame) {
     // build pool from ALL KFs — slow but fine since we're already LOST
-    cv::Mat                    pool_desc;
+    cv::Mat pool_desc;
     std::vector<MapPoint::Ptr> pool_mps;
     {
         std::unordered_set<long> seen_ids;
@@ -1244,16 +1040,16 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
 
     auto raw_matches = match_descriptors(pool_desc, frame->descriptors, true);
 
-    std::vector<cv::Point3f>   pts3d;
-    std::vector<cv::Point2f>   pts2d;
-    std::vector<int>           match_idxs;
+    std::vector<cv::Point3f> pts3d;
+    std::vector<cv::Point2f> pts2d;
+    std::vector<int> match_idxs;
     std::vector<MapPoint::Ptr> match_mps;
-    std::unordered_set<int>    used_kp;
+    std::unordered_set<int> used_kp;
 
     for (auto& m : raw_matches) {
         if (!used_kp.insert(m.trainIdx).second) continue;
         auto& mp = pool_mps[m.queryIdx];
-        auto& p  = mp->position;
+        auto& p = mp->position;
         pts3d.push_back({(float)p.x(), (float)p.y(), (float)p.z()});
         pts2d.push_back(frame->keypoints[m.trainIdx].pt);
         match_idxs.push_back(m.trainIdx);
@@ -1271,30 +1067,36 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
     cv::Mat inlier_mask;
 
     int reloc_pnp = ((int)pts3d.size() < 30) ? cv::SOLVEPNP_EPNP : cv::SOLVEPNP_SQPNP;
-    bool ok = cv::solvePnPRansac(
-        pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(),
-        rvec, tvec, /*useExtrinsicGuess=*/false,
-        cfg_.pnp_iterations, cfg_.pnp_reprojection, 0.99,
-        inlier_mask, reloc_pnp);
+    bool ok = cv::solvePnPRansac(pts3d, pts2d, cam_.K_cv(), cam_.dist_cv(), rvec, tvec,
+                                 /*useExtrinsicGuess=*/false, cfg_.pnp_iterations,
+                                 cfg_.pnp_reprojection, 0.99, inlier_mask, reloc_pnp);
 
-    if (!ok) { std::cerr << "[Reloc] solvePnPRansac failed\n"; return false; }
+    if (!ok) {
+        std::cerr << "[Reloc] solvePnPRansac failed\n";
+        return false;
+    }
 
     std::vector<bool> is_inlier(pts3d.size(), false);
     int n_reloc_inliers = 0;
     if (inlier_mask.type() == CV_8U) {
         for (int k = 0; k < inlier_mask.rows && k < (int)pts3d.size(); ++k)
-            if (inlier_mask.at<uint8_t>(k)) { is_inlier[k] = true; ++n_reloc_inliers; }
+            if (inlier_mask.at<uint8_t>(k)) {
+                is_inlier[k] = true;
+                ++n_reloc_inliers;
+            }
     } else {
         for (int k = 0; k < inlier_mask.rows; ++k) {
             int idx = inlier_mask.at<int>(k);
-            if (idx >= 0 && idx < (int)pts3d.size()) { is_inlier[idx] = true; ++n_reloc_inliers; }
+            if (idx >= 0 && idx < (int)pts3d.size()) {
+                is_inlier[idx] = true;
+                ++n_reloc_inliers;
+            }
         }
     }
 
     const int reloc_min = cfg_.pnp_min_inliers * 2;  // stricter than normal tracking — was 30
     if (n_reloc_inliers < reloc_min) {
-        std::cerr << "[Reloc] Inliers too few (" << n_reloc_inliers
-                  << " < " << reloc_min << ")\n";
+        std::cerr << "[Reloc] Inliers too few (" << n_reloc_inliers << " < " << reloc_min << ")\n";
         return false;
     }
 
@@ -1302,31 +1104,28 @@ bool Tracker::try_relocalize(Frame::Ptr frame)
     std::vector<cv::Point3f> in3d;
     std::vector<cv::Point2f> in2d;
     for (int i = 0; i < (int)pts3d.size(); ++i)
-        if (is_inlier[i]) { in3d.push_back(pts3d[i]); in2d.push_back(pts2d[i]); }
-    cv::solvePnP(in3d, in2d, cam_.K_cv(), cam_.dist_cv(),
-                 rvec, tvec, true, cv::SOLVEPNP_ITERATIVE);
+        if (is_inlier[i]) {
+            in3d.push_back(pts3d[i]);
+            in2d.push_back(pts2d[i]);
+        }
+    cv::solvePnP(in3d, in2d, cam_.K_cv(), cam_.dist_cv(), rvec, tvec, true, cv::SOLVEPNP_ITERATIVE);
 
     cv::Mat R_cv;
     cv::Rodrigues(rvec, R_cv);
     for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++)
-            frame->T_cw.linear()(r, c) = R_cv.at<double>(r, c);
-    frame->T_cw.translation() << tvec.at<double>(0),
-                                  tvec.at<double>(1),
-                                  tvec.at<double>(2);
+        for (int c = 0; c < 3; c++) frame->T_cw.linear()(r, c) = R_cv.at<double>(r, c);
+    frame->T_cw.translation() << tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2);
 
     for (int i = 0; i < (int)pts3d.size(); ++i)
-        if (is_inlier[i])
-            frame->map_points[match_idxs[i]] = match_mps[i];
+        if (is_inlier[i]) frame->map_points[match_idxs[i]] = match_mps[i];
 
     std::cout << "[Reloc] SUCCESS — " << inlier_mask.rows << " inliers\n";
     return true;
 }
 
-// --- stereo epipolar matching (ORB path) ---
+// stereo epipolar matching (ORB path)
 
-void Tracker::match_stereo(Frame::Ptr frame)
-{
+void Tracker::match_stereo(Frame::Ptr frame) {
     if (frame->descriptors.empty() || frame->descriptors_right.empty()) return;
     int N_q = frame->descriptors.rows;
     int N_t = frame->descriptors_right.rows;
@@ -1342,15 +1141,15 @@ void Tracker::match_stereo(Frame::Ptr frame)
         x_t[i] = frame->keypoints_right[i].pt.x;
     }
 
-    cv::Mat q = frame->descriptors.isContinuous()       ? frame->descriptors       : frame->descriptors.clone();
-    cv::Mat t = frame->descriptors_right.isContinuous() ? frame->descriptors_right : frame->descriptors_right.clone();
+    cv::Mat q = frame->descriptors.isContinuous() ? frame->descriptors : frame->descriptors.clone();
+    cv::Mat t = frame->descriptors_right.isContinuous() ? frame->descriptors_right
+                                                        : frame->descriptors_right.clone();
 
     std::vector<int> best_idx(N_q, -1), best_dist(N_q, kMaxHamming);
-    cuda_match_stereo_epipolar(
-        q.data, t.data, N_q, N_t,
-        y_q.data(), y_t.data(), x_q.data(), x_t.data(),
-        cfg_.stereo_epi_tol, cfg_.stereo_d_min, cfg_.stereo_d_max,
-        cfg_.lowe_ratio, best_idx.data(), best_dist.data());
+    cuda_match_stereo_epipolar(q.data, t.data, N_q, N_t, y_q.data(), y_t.data(), x_q.data(),
+                               x_t.data(), cfg_.stereo_epi_tol, cfg_.stereo_d_min,
+                               cfg_.stereo_d_max, cfg_.lowe_ratio, best_idx.data(),
+                               best_dist.data());
 
     for (int i = 0; i < N_q; ++i) {
         if (best_idx[i] >= 0 && best_dist[i] <= cfg_.hamming_threshold) {
@@ -1359,20 +1158,19 @@ void Tracker::match_stereo(Frame::Ptr frame)
     }
 }
 
-// --- stereo triangulation: metric depth Z = fx*b/d ---
+// stereo triangulation: metric depth Z = fx*b/d
 
-int Tracker::triangulate_stereo(Frame::Ptr frame)
-{
+int Tracker::triangulate_stereo(Frame::Ptr frame) {
     if (frame->uR.empty()) return 0;
     int n_added = 0;
     for (int i = 0; i < (int)frame->keypoints.size(); ++i) {
-        if (frame->uR[i] < 0.0f) continue;  // no stereo match
+        if (frame->uR[i] < 0.0f) continue;   // no stereo match
         if (frame->map_points[i]) continue;  // already mapped
 
         float u_L = frame->keypoints[i].pt.x;
         float v_L = frame->keypoints[i].pt.y;
         float u_R = frame->uR[i];
-        float d   = u_L - u_R;
+        float d = u_L - u_R;
         if (d < cfg_.stereo_d_min || d > cfg_.stereo_d_max) continue;
 
         double Z = cam_.fx * cam_.baseline / (double)d;
@@ -1392,8 +1190,7 @@ int Tracker::triangulate_stereo(Frame::Ptr frame)
 }
 
 // re-derive per-frame velocity from BA-corrected KF poses
-void Tracker::recompute_velocity_from_ba()
-{
+void Tracker::recompute_velocity_from_ba() {
     auto kfs = map_->local_window(2);
     if (kfs.size() < 2) {
         velocity_valid_ = false;
@@ -1408,7 +1205,7 @@ void Tracker::recompute_velocity_from_ba()
     // scale to per-frame rate: dt_frame / dt_kf
     double dt_kf = std::abs(kf1->timestamp - kf0->timestamp);
     if (dt_kf < 1e-6) dt_kf = 0.1;  // fallback for 10Hz
-    const double dt_frame = 0.1;     // KITTI is 10Hz
+    const double dt_frame = 0.1;    // KITTI is 10Hz
     double scale = dt_frame / dt_kf;
 
     Eigen::AngleAxisd ba_aa(ba_vel.rotation());
@@ -1426,8 +1223,8 @@ void Tracker::recompute_velocity_from_ba()
         Eigen::Quaterniond q_old(velocity_.rotation());
         Eigen::Quaterniond q_ba(ba_per_frame.rotation());
         Eigen::Quaterniond q_blend = q_old.slerp(alpha, q_ba);
-        Eigen::Vector3d t_blend = (1.0 - alpha) * velocity_.translation()
-                                + alpha * ba_per_frame.translation();
+        Eigen::Vector3d t_blend =
+            (1.0 - alpha) * velocity_.translation() + alpha * ba_per_frame.translation();
         velocity_ = Eigen::Isometry3d::Identity();
         velocity_.linear() = q_blend.toRotationMatrix();
         velocity_.translation() = t_blend;
@@ -1438,8 +1235,4 @@ void Tracker::recompute_velocity_from_ba()
 }
 
 // called by main after BA completes — re-seeds velocity from corrected poses
-void Tracker::notify_ba_update()
-{
-    recompute_velocity_from_ba();
-}
-
+void Tracker::notify_ba_update() { recompute_velocity_from_ba(); }

@@ -1,5 +1,5 @@
 // entry point — parses args, loads kitti seq, runs the main loop
-// usage: vslam.exe --sequence <path> [--start N] [--end N] [--no-viz] [--hybrid] [--xfeat <model>] [--lg <model>]
+// usage: vslam.exe --sequence <path> [--start N] [--end N] [--no-viz] [--hybrid] [--xfeat <model>]
 
 #include "slam/camera.hpp"
 #include "slam/frame.hpp"
@@ -11,7 +11,6 @@
 
 // Deep frontend (only compiled when ENABLE_DEEP_FRONTEND is defined in CMake)
 #ifdef ENABLE_DEEP_FRONTEND
-#include "deep/lighterglue_async.hpp"
 #include "deep/semi_dense_disparity.hpp"
 #include "deep/ttt_autoencoder.hpp"
 #include "deep/xfeat_extractor.hpp"
@@ -33,7 +32,7 @@
 
 namespace fs = std::filesystem;
 
-// --- kitti loader ---
+// kitti loader
 
 struct KittiSequence {
     std::string sequence_path;
@@ -96,7 +95,7 @@ struct KittiSequence {
     }
 };
 
-// --- arg parsing ---
+// arg parsing
 
 struct Args {
     std::string sequence_path;
@@ -105,7 +104,6 @@ struct Args {
     bool no_viz = false;
     bool hybrid = false;
     std::string xfeat_engine;
-    std::string lg_engine;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -124,8 +122,6 @@ Args parse_args(int argc, char** argv) {
             args.hybrid = true;
         } else if (a == "--xfeat" && i + 1 < argc) {
             args.xfeat_engine = argv[++i];
-        } else if (a == "--lg" && i + 1 < argc) {
-            args.lg_engine = argv[++i];
         } else if (a == "--help" || a == "-h") {
             std::cout << "Usage: vslam.exe --sequence <path> [--start N] [--end N] [--no-viz]\n";
             exit(0);
@@ -200,7 +196,7 @@ int main(int argc, char** argv) {
         seq.camera.height = img.rows;
     }
 
-    // --- init SLAM components ---
+    // init SLAM components
     auto map = slam::Map::create();
     auto local_ba = slam::LocalBA::create(seq.camera, map);
     auto pose_graph = slam::PoseGraph::create(map, seq.camera);
@@ -212,8 +208,6 @@ int main(int argc, char** argv) {
     if (args.hybrid) {
         std::string xfeat_path =
             args.xfeat_engine.empty() ? "models/xfeat_fp16.engine" : args.xfeat_engine;
-        std::string lg_path =
-            args.lg_engine.empty() ? "models/lighterglue_fp16.engine" : args.lg_engine;
 
         deep::XFeatExtractor::Config xfeat_cfg;
         xfeat_cfg.engine_path = xfeat_path;
@@ -221,14 +215,10 @@ int main(int argc, char** argv) {
         xfeat_cfg.img_height = seq.camera.height;
         auto xfeat = deep::XFeatExtractor::create(xfeat_cfg);
 
-        deep::LighterGlueAsync::Config lg_cfg;
-        lg_cfg.engine_path = lg_path;
-        auto lg = deep::LighterGlueAsync::create(lg_cfg);
-
         deep::TTTLoopDetector::Config ttt_cfg;
         auto ttt = deep::TTTLoopDetector::create(ttt_cfg);
 
-        tracker = slam::Tracker::create_hybrid(seq.camera, map, std::move(xfeat), std::move(lg),
+        tracker = slam::Tracker::create_hybrid(seq.camera, map, std::move(xfeat),
                                                std::move(ttt));
         std::cout << "[VSLAM] Hybrid deep-geometric mode enabled\n";
     } else
@@ -259,7 +249,7 @@ int main(int argc, char** argv) {
     std::vector<std::array<float, 3>> est_centers(n_frames, {0.f, 0.f, 0.f});
     std::vector<bool> est_valid(n_frames, false);
 
-    // --- per-frame metric accumulators ---
+    // per-frame metric accumulators
     double prev_yaw_gt = 0.0, prev_yaw_est = 0.0;
     bool prev_yaw_valid = false;
     double ate_turn_sum2 = 0.0, ate_straight_sum2 = 0.0;
@@ -268,7 +258,7 @@ int main(int argc, char** argv) {
     double final_yaw_err = 0.0;
     int lost_count = 0;
 
-    // --- main tracking loop ---
+    // main tracking loop
 #ifdef ENABLE_DEEP_FRONTEND
     deep::SemiDenseDisparity::Config sd_cfg;
     sd_cfg.baseline = (float)seq.camera.baseline;
@@ -349,7 +339,7 @@ int main(int argc, char** argv) {
         est_centers[i] = {(float)pos.x(), (float)pos.y(), (float)pos.z()};
         est_valid[i] = true;
 
-        // --- per-frame yaw & ATE diagnostics vs GT ---
+        // per-frame yaw & ATE diagnostics vs GT
         if (i < (int)gt_poses.size()) {
             Eigen::Matrix3d R_wc_est = frame->T_wc().rotation();
             Eigen::Matrix3d R_wc_gt = gt_poses[i].rotation();
@@ -416,7 +406,7 @@ int main(int argc, char** argv) {
                 map->num_map_points(), pos.x(), pos.y(), pos.z(), ok ? "OK" : "LOST");
     }
 
-    // --- summary ---
+    // summary
     auto t_end_wall = std::chrono::steady_clock::now();
     double elapsed_s = std::chrono::duration<double>(t_end_wall - t_start_wall).count();
     double fps = frame_count / elapsed_s;
@@ -426,7 +416,7 @@ int main(int argc, char** argv) {
               << "  Keyframes : " << map->num_keyframes() << "\n"
               << "  Map points: " << map->num_map_points() << "\n";
 
-    // --- metrics: ATE & RPE ---
+    // metrics: ATE & RPE
     if (!gt_centers_metrics.empty()) {
         double ate_sum2 = 0.0;
         double y_max_dev = 0.0;

@@ -19,7 +19,7 @@
 
 namespace slam {
 
-// --- StereoReprojCost: 3 residuals, analytical Jacobians ---
+// StereoReprojCost: 3 residuals, analytical Jacobians
 // SizedCostFunction<3, 7, 3>
 
 StereoReprojCost::StereoReprojCost(double obs_uL, double obs_vL, double obs_uR, double fx,
@@ -139,7 +139,7 @@ bool StereoReprojCost::Evaluate(double const* const* parameters, double* residua
     return true;
 }
 
-// --- MonoReprojCost: 2 residuals, analytical Jacobians ---
+// MonoReprojCost: 2 residuals, analytical Jacobians
 // SizedCostFunction<2, 7, 3>
 // same math as stereo but without the right-camera residual
 
@@ -227,7 +227,7 @@ bool MonoReprojCost::Evaluate(double const* const* parameters, double* residuals
     return true;
 }
 
-// --- pose <-> Isometry3d conversion (quaternion 7-DOF) ---
+// pose <-> Isometry3d conversion (quaternion 7-DOF)
 // NOTE: this is different from pose_graph.cpp which uses angle-axis 6-DOF
 
 static void isometry_to_pose(const Eigen::Isometry3d& T, double* pose) {
@@ -252,7 +252,7 @@ static Eigen::Isometry3d pose_to_isometry(const double* pose) {
     return T;
 }
 
-// --- quaternion point rotation (for post-BA culling) ---
+// quaternion point rotation (for post-BA culling)
 // Hamilton double-cross: result = q * p * q^{-1}
 static void quat_rotate_point(const double* q, const double* p, double* result) {
     const double qx = q[0], qy = q[1], qz = q[2], qw = q[3];
@@ -266,7 +266,7 @@ static void quat_rotate_point(const double* q, const double* p, double* result) 
     result[2] = p[2] + qw * tz + qx * ty - qy * tx;
 }
 
-// --- marginalization helpers ---
+// marginalization helpers
 
 // 7x6 PlusJacobian of ProductManifold(EigenQuaternion, Euclidean<3>)
 // J_plus maps tangent delta (R^6) to ambient perturbation (R^7)
@@ -331,7 +331,7 @@ static Eigen::Matrix<double, 6, 1> pose_tangent_delta(const double* x, const dou
     return delta;
 }
 
-// --- MarginalizationPriorCost ---
+// MarginalizationPriorCost
 
 MarginalizationPriorCost::MarginalizationPriorCost(const MarginalizationInfo& info)
     : info_(info)
@@ -381,7 +381,7 @@ bool MarginalizationPriorCost::Evaluate(double const* const* parameters,
     return true;
 }
 
-// --- LocalBA factory + optimize() ---
+// LocalBA factory + optimize()
 
 LocalBA::Ptr LocalBA::create(const Camera& cam, Map::Ptr map, const Config& cfg) {
     auto ba = std::shared_ptr<LocalBA>(new LocalBA());
@@ -418,7 +418,7 @@ void LocalBA::optimize() {
         point_params[id] = {mp->position.x(), mp->position.y(), mp->position.z()};
     }
 
-    // --- build Ceres problem ---
+    // build Ceres problem
     ceres::Problem problem;
     ceres::LossFunction* loss = new ceres::HuberLoss(cfg_.huber_delta);
 
@@ -483,7 +483,7 @@ void LocalBA::optimize() {
         problem.AddParameterBlock(pt.data(), 3);
     }
 
-    // --- gauge freedom: marg prior or fix oldest KF ---
+    // gauge freedom: marg prior or fix oldest KF
     // if we have a valid marg prior w/ all poses in window, inject it (provides gauge)
     // otherwise fall back to fixing oldest KF constant
     bool prior_injected = false;
@@ -518,7 +518,7 @@ void LocalBA::optimize() {
         problem.SetParameterBlockConstant(pose_params[window.front()->id].data());  // fix oldest
     }
 
-    // --- solve ---
+    // solve
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
@@ -556,7 +556,7 @@ void LocalBA::optimize() {
         mp->position = Eigen::Vector3d(pt[0], pt[1], pt[2]);
     }
 
-    // --- post-BA culling ---
+    // post-BA culling
     {
         const double cull_thresh2 = 49.0;  // 7px^2
         for (auto& kf : window) {
@@ -627,13 +627,13 @@ void LocalBA::optimize() {
 
     map_->cleanup_bad_map_points();
 
-    // --- marginalization: capture info before oldest KF drops out ---
+    // marginalization: capture info before oldest KF drops out
     if ((int)window.size() >= cfg_.window_size) {
         compute_marginalization_prior(window, pose_params, point_params);
     }
 }
 
-// --- compute_marginalization_prior() ---
+// compute_marginalization_prior()
 // builds reduced camera Hessian via Schur complement:
 // 1. identify oldest KF + connected poses (shared map pts)
 // 2. for each map pt seen by oldest KF: accumulate per-point Hessian, Schur out
@@ -698,7 +698,7 @@ void LocalBA::compute_marginalization_prior(
     const double info_uv = 1.0 / sigma2;
     const double z_ref2  = cfg_.z_ref * cfg_.z_ref;
 
-    // --- process each map pt observed by oldest KF ---
+    // process each map pt observed by oldest KF
     for (long pt_id : oldest_point_ids) {
         auto obs_it = point_observers.find(pt_id);
         if (obs_it == point_observers.end()) continue;
@@ -825,7 +825,7 @@ void LocalBA::compute_marginalization_prior(
         }
     }
 
-    // --- chain old prior contribution into the Hessian ---
+    // chain old prior contribution into the Hessian
     if (marg_info_.valid) {
         std::vector<const double*> prior_params;
         std::vector<int> prior_pose_indices;
@@ -887,7 +887,7 @@ void LocalBA::compute_marginalization_prior(
         }
     }
 
-    // --- marginalize oldest pose (index 0) ---
+    // marginalize oldest pose (index 0)
     const int marg_dim = 6;
     const int keep_dim = H_dim - marg_dim;
 
@@ -918,7 +918,7 @@ void LocalBA::compute_marginalization_prior(
 
     H_star = 0.5 * (H_star + H_star.transpose());  // symmetrize (numerical)
 
-    // --- eigendecompose, clamp, build S & e0 ---
+    // eigendecompose, clamp, build S & e0
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(H_star);
     if (eig.info() != Eigen::Success) {
         fprintf(stderr, "[BA-MARG] Eigendecomposition failed — skipping\n");
@@ -945,7 +945,7 @@ void LocalBA::compute_marginalization_prior(
     Eigen::VectorXd inv_sqrt_D = sqrt_D.cwiseInverse();
     Eigen::VectorXd e0 = inv_sqrt_D.asDiagonal() * V.transpose() * b_star;
 
-    // --- store new prior ---
+    // store new prior
     MarginalizationInfo new_info;
     new_info.valid = true;
     new_info.S  = S;

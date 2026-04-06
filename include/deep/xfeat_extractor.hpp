@@ -7,8 +7,6 @@
 // Ownership contract for XFeatResult::descriptors_pinned:
 //   - Pointer is valid until the NEXT call to extract() that cycles back to the same slot
 //     (i.e. valid for at least 2 subsequent extract() calls with triple-buffering).
-//   - LighterGlueAsync::submit_job() performs a DEEP COPY before enqueuing, so no
-//     cross-thread lifetime issues arise from borrowed pointers.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

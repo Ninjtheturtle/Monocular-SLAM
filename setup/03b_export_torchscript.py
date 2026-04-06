@@ -1,5 +1,5 @@
 """
-Export XFeat backbone and LighterGlue as TorchScript .pt models.
+Export XFeat backbone as a TorchScript .pt model.
 
 XFeat approach: export ONLY the convolutional backbone (fixed output shape),
 then do NMS + descriptor sampling in C++ using CUDA kernels.
@@ -12,11 +12,8 @@ Backbone output:
 
 C++ side (xfeat_extractor.cu) runs: ANMS on K1h, then grid_sample on M1.
 
-LighterGlue: traced with the correct interface (data dict -> unwrapped via wrapper).
-
 Run: python setup/03b_export_torchscript.py
 Out: models/xfeat.pt        (backbone only)
-     models/lighterglue.pt
 """
 
 import sys, os, tempfile, subprocess
@@ -51,8 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, str(AF_DIR))
-from modules.xfeat      import XFeat
-from modules.lighterglue import LighterGlue as LighterGlueModel
+from modules.xfeat import XFeat
 
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 # XFeat's preprocess_tensor does (H//32)*32, (W//32)*32 internally.
@@ -118,78 +114,5 @@ with torch.no_grad():
     M1_v, K1h_v, H1_v = loaded(dummy_img)
 print(f"  Verified: M1={M1_v.shape}, K1h={K1h_v.shape}, H1={H1_v.shape}")
 
-# ── 2. LighterGlue TorchScript ───────────────────────────────────────────────
-print("\n=== Exporting LighterGlue to TorchScript ===")
-
-class LighterGlueWrapper(nn.Module):
-    """
-    Wraps LighterGlue to accept flat tensors (no dict).
-    Input:  kps0 (1,N,2), desc0 (1,N,64), kps1 (1,M,2), desc1 (1,M,64)
-    Output: matches (N,) int64 (-1 = unmatched), scores (N,) float32
-    """
-    def __init__(self):
-        super().__init__()
-        self.lg = LighterGlueModel()  # loads pretrained weights automatically
-        self.lg.eval()
-        self.img_h = float(IMG_H_KITTI)
-        self.img_w = float(IMG_W_KITTI)
-
-    def forward(self, kps0: torch.Tensor, desc0: torch.Tensor,
-                      kps1: torch.Tensor, desc1: torch.Tensor):
-        # kps: (1,N,2) pixel coords;  desc: (1,N,64) L2-normalised
-        img_size = torch.tensor([[self.img_h, self.img_w]],
-                                 dtype=torch.float32, device=kps0.device)
-        data = {
-            'keypoints0':   kps0,
-            'descriptors0': desc0,
-            'image_size0':  img_size,
-            'keypoints1':   kps1,
-            'descriptors1': desc1,
-            'image_size1':  img_size,
-        }
-        result = self.lg(data, min_conf=0.1)
-        matches = result['matches0'].squeeze(0)   # (N,) int64
-        scores  = result['scores0'].squeeze(0)    # (N,) float
-        return matches, scores
-
-lg_wrapper = LighterGlueWrapper().to(DEVICE).eval()
-
-N = M = 512
-dummy_kps0  = torch.rand(1, N, 2,  device=DEVICE) * float(IMG_W_KITTI)
-dummy_desc0 = F.normalize(torch.rand(1, N, 64, device=DEVICE), dim=-1)
-dummy_kps1  = torch.rand(1, M, 2,  device=DEVICE) * float(IMG_W_KITTI)
-dummy_desc1 = F.normalize(torch.rand(1, M, 64, device=DEVICE), dim=-1)
-
-print("  Running forward to verify interface...")
-with torch.no_grad():
-    try:
-        matches_t, scores_t = lg_wrapper(dummy_kps0, dummy_desc0, dummy_kps1, dummy_desc1)
-        print(f"  LG output: matches={matches_t.shape}, scores={scores_t.shape}")
-        lg_ok = True
-    except Exception as e:
-        print(f"  LG forward failed: {e}")
-        lg_ok = False
-
-lg_out = str(MODELS / "lighterglue.pt")
-if lg_ok:
-    print(f"  Tracing -> {lg_out}")
-    with torch.no_grad():
-        lg_traced = torch.jit.trace(
-            lg_wrapper,
-            (dummy_kps0, dummy_desc0, dummy_kps1, dummy_desc1),
-            strict=False
-        )
-    lg_traced.save(lg_out)
-    sz = os.path.getsize(lg_out) / 1e6
-    print(f"  Saved ({sz:.1f} MB): {lg_out}")
-
-    lg_loaded = torch.jit.load(lg_out).to(DEVICE).eval()
-    with torch.no_grad():
-        m2, s2 = lg_loaded(dummy_kps0, dummy_desc0, dummy_kps1, dummy_desc1)
-    print(f"  Verified: matches={m2.shape}, scores={s2.shape}")
-else:
-    print("  Skipping LighterGlue (relocalization will use L2 matching fallback)")
-
 print("\n=== DONE ===")
 print(f"  {xfeat_out}  -- backbone: M1 (64xH/8xW/8), K1h (heatmap), H1 (reliability)")
-print(f"  {lg_out}")

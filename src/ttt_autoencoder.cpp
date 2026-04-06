@@ -19,9 +19,7 @@
 
 namespace deep {
 
-// ---------------------------------------------------------------------------
 // TTTAutoEncoder module
-// ---------------------------------------------------------------------------
 TTTAutoEncoderImpl::TTTAutoEncoderImpl() {
     enc1 = register_module("enc1", torch::nn::Linear(kTTTDescDim,  kTTTLatentDim));
     enc2 = register_module("enc2", torch::nn::Linear(kTTTLatentDim, kTTTLatentDim));
@@ -41,9 +39,7 @@ torch::Tensor TTTAutoEncoderImpl::forward(torch::Tensor x) {
     return dec2->forward(r);
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 torch::Tensor TTTLoopDetector::descs_to_tensor(
     const std::vector<std::vector<float>>& descs)
 {
@@ -91,9 +87,7 @@ torch::Tensor TTTLoopDetector::sample_replay_batch(int n) {
     return batch;
 }
 
-// ---------------------------------------------------------------------------
 // Factory
-// ---------------------------------------------------------------------------
 std::unique_ptr<TTTLoopDetector> TTTLoopDetector::create(const Config& cfg) {
     auto det = std::unique_ptr<TTTLoopDetector>(new TTTLoopDetector());
     det->cfg_ = cfg;
@@ -117,9 +111,7 @@ std::unique_ptr<TTTLoopDetector> TTTLoopDetector::create(const Config& cfg) {
     return det;
 }
 
-// ---------------------------------------------------------------------------
 // Destructor
-// ---------------------------------------------------------------------------
 TTTLoopDetector::~TTTLoopDetector() {
     shutdown_.store(true, std::memory_order_release);
     {
@@ -130,9 +122,7 @@ TTTLoopDetector::~TTTLoopDetector() {
     if (thread_.joinable()) thread_.join();
 }
 
-// ---------------------------------------------------------------------------
 // push_keyframe (main thread, non-blocking)
-// ---------------------------------------------------------------------------
 void TTTLoopDetector::push_keyframe(TTTUpdateJob job) {
     {
         std::lock_guard<std::mutex> lk(input_mtx_);
@@ -143,9 +133,7 @@ void TTTLoopDetector::push_keyframe(TTTUpdateJob job) {
     input_cv_.notify_one();
 }
 
-// ---------------------------------------------------------------------------
 // update_embedding_position (main thread, non-blocking)
-// ---------------------------------------------------------------------------
 void TTTLoopDetector::update_embedding_position(long kf_id, const Eigen::Vector3d& new_pos) {
     std::lock_guard<std::mutex> lk(embed_mtx_);
     for (auto& e : scene_embeddings_) {
@@ -153,9 +141,7 @@ void TTTLoopDetector::update_embedding_position(long kf_id, const Eigen::Vector3
     }
 }
 
-// ---------------------------------------------------------------------------
 // query_loop_candidates (main thread, thread-safe read)
-// ---------------------------------------------------------------------------
 std::vector<long> TTTLoopDetector::query_loop_candidates(
     const std::vector<std::vector<float>>& query_descs,
     int top_k) const
@@ -197,9 +183,7 @@ std::vector<long> TTTLoopDetector::query_loop_candidates(
     return result;
 }
 
-// ---------------------------------------------------------------------------
 // thread_worker — background gradient updates
-// ---------------------------------------------------------------------------
 void TTTLoopDetector::thread_worker() {
     fprintf(stderr, "[TTT] Background thread started\n");
     try {
